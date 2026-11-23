@@ -49,7 +49,7 @@
     <div class="row top">
       <div>
         <h1 class="name">Membrane</h1>
-        <p class="note" id="note">Drag the nucleus to stir the cell. Shove it into the wall and the membrane tears, and the cell dies.</p>
+        <p class="note" id="note">Drag the nucleus to stir the cell. Lean on the wall and it stretches thin, flushes pink, then tears.</p>
       </div>
       <button id="again" type="button">New specimen</button>
     </div>
@@ -80,18 +80,24 @@ const ROPES = 2, RLEN = 52, RLINK = 0.07, RRAD = 0.045;
 const HAIRS = 4, HSEG = 6;
 const TENSION = 0.95;                // the wall is always slightly too short, so it squeezes the cytoplasm
 const P = {                          // tunables
-  sub: 3, iter: 3,
+  sub: 3, iter: 4,
   nSpeed: 0.036,                     // nucleus travel per substep while dragged
-  mVisc: 0.66, pVisc: 0.94,           // how much of a correction survives the medium's drag
-  s0: 0.3, dk: 0.3,
-  press: 0.007,                      // damage per substep while the nucleus is leaned on the wall                 // tear: stretch threshold and damage rate
+  mVisc: 0.88, pVisc: 0.96,           // how much of a correction survives the medium's drag
+  creepFrom: 1.07, creep: 0.0026,     // a wall stretched past creepFrom grows longer and thinner, for good
+  tearAt: 1.5,
+  tow: 0.7,                         // share of a push on the wall that moves the whole cell instead                       // ...and gives way once it has thinned this much
 };
 
 // ───────────────────────── simulation state ─────────────────────────
 const mx = new Float32Array(NM), mz = new Float32Array(NM), msx = new Float32Array(NM), msz = new Float32Array(NM);
 const rest0 = new Float32Array(NM), rest = new Float32Array(NM), bend = new Float32Array(NM);
-const broken = new Uint8Array(NM), damage = new Float32Array(NM);
-const lnx = new Float32Array(NM), lnz = new Float32Array(NM);
+const broken = new Uint8Array(NM), damage = new Float32Array(NM), elong = new Float32Array(NM), breakAt = new Float32Array(NM);
+// the skirt: the striped outer layer that carries the cilia. It rides on the beads until the cell dies, then peels off in ribbons.
+const sx = new Float32Array(NM), sz = new Float32Array(NM), svx = new Float32Array(NM), svz = new Float32Array(NM);
+const snx = new Float32Array(NM), snz = new Float32Array(NM), sFlat = new Float32Array(NM), sPeelAt = new Float32Array(NM);
+const sAtt = new Uint8Array(NM), sBrk = new Uint8Array(NM);
+let tearIdx = 0;
+const lnx = new Float32Array(NM), lnz = new Float32Array(NM), pnx = new Float32Array(NM), pnz = new Float32Array(NM);
 const px = new Float32Array(MAXP), pz = new Float32Array(MAXP), psx = new Float32Array(MAXP), psz = new Float32Array(MAXP);
 const pfx = new Float32Array(MAXP), pfz = new Float32Array(MAXP), prad = new Float32Array(MAXP), prope = new Int8Array(MAXP);
 let np = 0, nc = 0;
@@ -128,7 +134,8 @@ function resetSim() {
     const k = (i + 1) % NM, k2 = (i + 2) % NM;
     rest0[i] = Math.hypot(mx[k] - mx[i], mz[k] - mz[i]); rest[i] = rest0[i] * TENSION;
     bend[i] = Math.hypot(mx[k2] - mx[i], mz[k2] - mz[i]);
-    broken[i] = 0; damage[i] = 0;
+    broken[i] = 0; damage[i] = 0; elong[i] = 1; breakAt[i] = 1e9;
+    sAtt[i] = 1; sBrk[i] = 0; sFlat[i] = 0; svx[i] = svz[i] = 0; sPeelAt[i] = 1e9;
   }
   const inside = (x, z) => {
     let c = false;
@@ -190,10 +197,26 @@ function linkNormals() {
 function breakLink(i) {
   if (broken[i]) return;
   broken[i] = 1;
-  if (!ruptured) { ruptured = true; ruptureT = time; }
+  if (ruptured) return;
+  ruptured = true; ruptureT = time; tearIdx = i;
+  // the skirt peels away from the tear in both directions, splitting into long ribbons as it goes
+  let run = 0, len = 9 + Math.random() * 12;
+  for (let a = 0; a < NM; a++) {
+    const k = (i + 1 + a) % NM, d = Math.min(a, NM - 1 - a);
+    sPeelAt[k] = 3.2 + d * 0.16 + Math.random() * 0.5;
+    if (++run > len) { sBrk[k] = 1; run = 0; len = 9 + Math.random() * 14; }
+  }
+  // the bead chain comes apart later: a few long strands, and stretches that crumble into clumps of two to four
+  let k = i, crumble = false, left = 0;
+  for (let a = 1; a < NM; a++) {
+    k = (i + a) % NM;
+    if (left-- <= 0) { crumble = !crumble; left = crumble ? 5 + Math.random() * 8 : 10 + Math.random() * 14; if (!crumble) breakAt[k] = 5 + Math.random() * 5; }
+    if (crumble && Math.random() < 0.42) breakAt[k] = 5 + Math.random() * 6;
+  }
 }
 
 function substep() {
+  const holds = ruptured ? Math.max(0, 1 - (time - ruptureT - 4.5) / 3) : 1;   // how much the wall still contains the cytoplasm
   msx.set(mx); msz.set(mz); psx.set(px); psz.set(pz);
   if (nuc.drag) {
     const dx = nuc.tx - nuc.x, dz = nuc.tz - nuc.z, l = Math.hypot(dx, dz);
@@ -250,7 +273,7 @@ function substep() {
     }
     // the wall holds the cytoplasm in (and loose strips of wall still shove it about)
     linkNormals();
-    for (let i = 0; i < NM; i++) {
+    for (let i = 0; i < NM && holds > 0.02; i++) {
       if (broken[i]) continue;
       const k = (i + 1) % NM, ax = mx[i], az = mz[i], ex = mx[k] - ax, ez = mz[k] - az, il2 = 1 / (ex * ex + ez * ez + 1e-9);
       const nx = lnx[i], nz = lnz[i];
@@ -261,7 +284,7 @@ function substep() {
         t = t < 0 ? 0 : t > 1 ? 1 : t;
         const sd = (rx - ex * t) * nx + (rz - ez * t) * nz, md = MW * 0.5 + prad[q];
         if (sd <= -md || sd >= md) continue;
-        const dl = sd < md * 0.3 ? -md - sd : md - sd;
+        const dl = (sd < md * 0.3 ? -md - sd : md - sd) * holds;
         px[q] += nx * dl * 0.72; pz[q] += nz * dl * 0.72;
         const w = dl * 0.28;
         mx[i] -= nx * w * (1 - t); mz[i] -= nz * w * (1 - t); mx[k] -= nx * w * t; mz[k] -= nz * w * t;
@@ -271,24 +294,29 @@ function substep() {
   // the medium is thick: only part of each correction survives
   for (let i = 0; i < NM; i++) { mx[i] = msx[i] + (mx[i] - msx[i]) * P.mVisc; mz[i] = msz[i] + (mz[i] - msz[i]) * P.mVisc; }
   for (let i = 0; i < np; i++) { px[i] = psx[i] + (px[i] - psx[i]) * P.pVisc; pz[i] = psz[i] + (pz[i] - psz[i]) * P.pVisc; }
-  // the nucleus can never pass through a bead of intact wall
+  // the nucleus can never pass through a bead of intact wall; what the wall will not give, the whole cell does,
+  // sliding across the slide after the nucleus
+  let bx = 0, bz = 0;
   for (let i = 0; i < NM; i++) {
     const dx = mx[i] - nuc.x, dz = mz[i] - nuc.z, d2 = dx * dx + dz * dz;
     if (d2 >= minNM * minNM) continue;
     const d = Math.sqrt(d2) || 1e-6, o = (minNM - d) / d;
-    nuc.x -= dx * o; nuc.z -= dz * o;
-    if (nuc.drag) {
-      // how hard the hand is leaning: the part of the pull that points into this bead
-      const lean = Math.min(1.4, Math.max(0, ((nuc.tx - nuc.x) * dx + (nuc.tz - nuc.z) * dz) / d));
-      const p = (i + NM - 1) % NM; damage[i] += P.press * lean; damage[p] += P.press * lean;
-    }
+    nuc.x -= dx * o; nuc.z -= dz * o; bx += dx * o; bz += dz * o;
   }
-  // stretch turns into damage, damage into a tear
-  for (let i = 0; i < NM; i++) {
-    if (broken[i]) continue;
-    const k = (i + 1) % NM, st = Math.hypot(mx[k] - mx[i], mz[k] - mz[i]) / rest0[i];
-    if (st > 1 + P.s0) { damage[i] += (st - 1 - P.s0) * P.dk; if (damage[i] > 1) breakLink(i); }
-    else if (damage[i] > 1) breakLink(i); else damage[i] *= 0.994;
+  const tow = P.tow * holds;
+  if (tow > 0 && (bx || bz)) {
+    bx *= tow; bz *= tow; nuc.x += bx; nuc.z += bz;
+    for (let i = 0; i < NM; i++) { mx[i] += bx; mz[i] += bz; }
+    for (let i = 0; i < np; i++) { px[i] += bx; pz[i] += bz; }
+  }
+  // a stretched wall creeps: it grows longer and thinner where it is pulled, and tears once it is thin enough
+  if (!ruptured) for (let i = 0; i < NM; i++) {
+    const k = (i + 1) % NM, st = Math.hypot(mx[k] - mx[i], mz[k] - mz[i]) / rest[i];
+    if (st > P.creepFrom) {
+      elong[i] += (st - P.creepFrom) * P.creep; rest[i] = rest0[i] * TENSION * elong[i];
+      if (elong[i] > P.tearAt) breakLink(i);
+    }
+    damage[i] = (elong[i] - 1.12) / (P.tearAt - 1.12);
   }
 }
 
@@ -304,25 +332,58 @@ function stepFrame() {
   const jig = 0.0016 * (1 - 0.85 * death);
   for (let i = 0; i < np; i++) { px[i] += (Math.random() - 0.5) * jig; pz[i] += (Math.random() - 0.5) * jig; }
   if (ruptured) {
-    // a torn wall loses its tension, tightens, and comes apart piece by piece
-    const age = time - ruptureT, sh = 1 - 0.22 * Math.min(1, age / 6);
-    death = Math.min(1, age / 9); death = death * death * (3 - 2 * death);
-    let intact = 0, cx = 0, cz = 0;
-    for (let i = 0; i < NM; i++) { rest[i] = rest0[i] * TENSION * sh; if (!broken[i]) intact++; cx += mx[i]; cz += mz[i]; }
+    const age = time - ruptureT;
+    death = Math.min(1, Math.max(0, age - 3) / 8); death = death * death * (3 - 2 * death);
+    // first the torn wall recoils and squeezes the contents out through the gap; then it goes slack
+    const squeeze = Math.min(1, age / 3.5) * (1 - Math.min(1, Math.max(0, age - 5) / 4));
+    let cx = 0, cz = 0;
+    for (let i = 0; i < NM; i++) { rest[i] = rest0[i] * TENSION * elong[i] * (1 - 0.24 * squeeze); cx += mx[i]; cz += mz[i]; damage[i] *= 0.97; }
     cx /= NM; cz /= NM;
-    // the wall crumbles into strips and loose beads
-    if (intact > NM * 0.34 && age > 0.4) {
-      const rate = 0.0012 + 0.004 * Math.min(1, age / 5);
-      for (let i = 0; i < NM; i++) {
-        if (broken[i]) continue;
-        const nearTear = broken[(i + 1) % NM] || broken[(i + NM - 1) % NM];
-        if (Math.random() < (nearTear ? rate : rate * 0.25)) breakLink(i);
-      }
-    }
+    // the gap widens a little, then the bead chain parts where it was always going to
+    if (age < 3 && Math.random() < 0.03) { const side = Math.random() < 0.5 ? 1 : NM - 1; let k = tearIdx; while (broken[k]) k = (k + side) % NM; if (Math.abs(((k - tearIdx + NM + NM / 2) % NM) - NM / 2) < 4) broken[k] = 1; }
+    for (let i = 0; i < NM; i++) if (age > breakAt[i]) broken[i] = 1;
     // with nothing holding it in, the contents slump and spread, carrying the wreckage outward
-    const swell = 1 + 0.3 * Math.min(1, age / 10), drift = 0.0011 * Math.max(0, 1 - age / 16);
+    const swell = 1 + 0.32 * Math.min(1, Math.max(0, age - 2) / 9), drift = 0.0009 * death * Math.max(0, 1 - age / 20);
     for (let i = 0; i < nc; i++) prad[i] = PR * swell;
     for (let i = 0; i < NM; i++) { mx[i] += (mx[i] - cx) * drift; mz[i] += (mz[i] - cz) * drift; }
+    for (let i = 0; i < NM; i++) if (sAtt[i] && age > sPeelAt[i]) {
+      sAtt[i] = 0; const kick = 0.006 + Math.random() * 0.006;
+      svx[i] = snx[i] * kick + (Math.random() - 0.5) * 0.004; svz[i] = snz[i] * kick + (Math.random() - 0.5) * 0.004;
+    }
+  }
+  stepSkirt();
+}
+
+function skirtLink(i) { const k = (i + 1) % NM; return !sBrk[i] && !(sAtt[i] && sAtt[k] && broken[i]); }
+function stepSkirt() {
+  // bead normals: average of the intact links either side
+  linkNormals();
+  for (let i = 0; i < NM; i++) {
+    const p = (i + NM - 1) % NM; let nx = 0, nz = 0;
+    if (!broken[i]) { nx += lnx[i]; nz += lnz[i]; } if (!broken[p]) { nx += lnx[p]; nz += lnz[p]; }
+    const l = Math.hypot(nx, nz); if (l > 1e-5) { pnx[i] = nx / l; pnz[i] = nz / l; }
+  }
+  const ww = MW * 0.45;
+  for (let i = 0; i < NM; i++) {
+    if (sAtt[i]) { sx[i] = mx[i] + pnx[i] * ww; sz[i] = mz[i] + pnz[i] * ww; snx[i] = pnx[i]; snz[i] = pnz[i]; continue; }
+    sFlat[i] = Math.min(1, sFlat[i] + 1 / 80);
+    svx[i] *= 0.985; svz[i] *= 0.985; sx[i] += svx[i]; sz[i] += svz[i];
+    const dx = sx[i] - nuc.x, dz = sz[i] - nuc.z, d = Math.hypot(dx, dz), md = NR + 0.12;     // the nucleus still shoves loose ribbon about
+    if (d < md) { sx[i] += dx / d * (md - d); sz[i] += dz / d * (md - d); }
+  }
+  for (let it = 0; it < 3; it++) for (let i = 0; i < NM; i++) {
+    const k = (i + 1) % NM; if (!skirtLink(i) || (sAtt[i] && sAtt[k])) continue;
+    let dx = sx[k] - sx[i], dz = sz[k] - sz[i]; const d = Math.hypot(dx, dz) || 1e-6, c = (d - rest0[i] * 1.05) / d;
+    const wi = sAtt[i] ? 0 : sAtt[k] ? 1 : 0.5, wk = sAtt[k] ? 0 : sAtt[i] ? 1 : 0.5;
+    sx[i] += dx * c * wi; sz[i] += dz * c * wi; sx[k] -= dx * c * wk; sz[k] -= dz * c * wk;
+  }
+  // a loose ribbon lies flat; its width runs across its own length
+  for (let i = 0; i < NM; i++) {
+    if (sAtt[i]) continue;
+    const p = (i + NM - 1) % NM, k = (i + 1) % NM, a = skirtLink(p) ? p : i, b = skirtLink(i) ? k : i;
+    if (a === b) continue;
+    const tx = sx[b] - sx[a], tz = sz[b] - sz[a], l = Math.hypot(tx, tz) || 1e-6;
+    snx[i] += (tz / l - snx[i]) * 0.3; snz[i] += (-tx / l - snz[i]) * 0.3;
   }
 }
 
@@ -533,18 +594,20 @@ function bandMesh(order, fs) {
     fragmentShader: NOISE + fs,
   })));
   m.frustumCulled = false; m.renderOrder = order; scene.add(m);
-  return { geo: g, pos, dmg };
+  return { geo: g, pos, dmg, mesh: m };
 }
 const wall = bandMesh(3, `varying vec2 vUv; uniform float uFade;
   void main(){ float bu = fract(vUv.x), v = vUv.y;
-    vec3 col = mix(vec3(.76, .62, .82), vec3(.56, .40, .66), v);
+    vec3 col = mix(vec3(.74, .58, .82), vec3(.56, .38, .68), v);
     col *= .86 + .14 * smoothstep(0., .22, abs(bu - .5) * 2.);
+    col *= .9 + .1 * smoothstep(.2, .5, abs(fract(vUv.x * 4.) - .5) * 2.);     // fine cross-striation
     col = mix(col, vec3(.86, .8, .9), smoothstep(.12, 0., v) * .6);
     float l = dot(col, vec3(.3, .5, .2)); col = mix(col, mix(vec3(l), col, .6), uFade);
-    gl_FragColor = vec4(col, .8 - .25 * v); }`);
+    gl_FragColor = vec4(col, mix(.8 - .25 * v, .62, uFade)); }`);
+const wallMesh = wall.mesh;
 const band = bandMesh(8, `varying vec2 vUv; varying float vD; uniform float uFade;
   void main(){ float bu = fract(vUv.x), v = vUv.y, c = abs(v - .5);
-    float edge = .5 - .06 * (1. - sin(bu * 3.14159));
+    float edge = .5 - (.06 + .09 * uFade) * (1. - sin(bu * 3.14159));
     float a = smoothstep(edge, edge - .05, c);
     if (a < .01) discard;
     vec3 col = vec3(.905, .895, .925) * (.9 + .1 * sin(v * 3.14159));
@@ -587,21 +650,25 @@ const cyto = new THREE.Mesh(sheet, new THREE.ShaderMaterial(flat({
     void main(){
       vec2 uv = vW / (2. * uHalf) + .5;
       float f = texture2D(tField, uv).b;
-      float a = smoothstep(.26, .5, f);
-      if (a < .01) discard;
       vec2 d = texture2D(tDisp, uv).rg;
-      vec3 col = stain(vW + d + .04 * vec2(sin(uTime * .3 + vW.y * 2.), cos(uTime * .27 + vW.x * 2.)));
       vec2 e = vec2(1.5) / vec2(${FW}., ${FH}.);
       vec2 g = vec2(texture2D(tField, uv + vec2(e.x, 0.)).b - texture2D(tField, uv - vec2(e.x, 0.)).b,
                     texture2D(tField, uv + vec2(0., e.y)).b - texture2D(tField, uv - vec2(0., e.y)).b);
-      float rim = 1. - smoothstep(.45, .95, f);
+      // a dead cell is only a stain: its edge frays into fibres that run outward
+      vec2 gd = normalize(g + 1e-5), q = vW + d * .5;
+      float fibre = vnoise(vec2(dot(q, vec2(-gd.y, gd.x)) * 15., dot(q, gd) * 1.6)) * .7 + vnoise(q * 30.) * .3;
+      float fr = f * mix(1., .25 + 1.5 * fibre, uFade);
+      float a = mix(smoothstep(.26, .5, f), smoothstep(.16, .62, fr), uFade);
+      if (a < .01) discard;
+      vec3 col = stain(vW + d + .04 * vec2(sin(uTime * .3 + vW.y * 2.), cos(uTime * .27 + vW.x * 2.)));
+      float rim = (1. - smoothstep(.45, .95, f)) * (1. - uFade);
       col = mix(col, vec3(.44, .2, .56), rim * .5);                       // the stain pools at the edge
       col += dot(g, vec2(-.6, -.8)) * rim * .5;                          // a little relief where the slab ends
       float l = dot(col, vec3(.3, .5, .2));
       vec3 dead = vec3(l) * vec3(1.0, .8, 1.03) + vec3(.07, .03, .08);
       dead *= .9 + .2 * vnoise(vW * 26.) * vnoise(vW * 61. + 3.);          // the stain turns grainy once the flow stops
-      col = mix(col, dead, uFade * .82);
-      gl_FragColor = vec4(col, a * .95);
+      col = mix(col, dead, uFade * .6);
+      gl_FragColor = vec4(col, a * mix(.95, .86, uFade));
     }`,
 })));
 cyto.position.y = H; cyto.renderOrder = 5; scene.add(cyto);
@@ -671,7 +738,6 @@ const postMat = new THREE.ShaderMaterial({
 });
 
 // ───────────────────────── per-frame geometry ─────────────────────────
-const pnx = new Float32Array(NM), pnz = new Float32Array(NM);
 function updateGeometry() {
   // fluid splats
   for (let i = 0; i < np; i++) { fPos[i * 3] = px[i]; fPos[i * 3 + 2] = pz[i]; fVel[i * 2] = px[i] - pfx[i]; fVel[i * 2 + 1] = pz[i] - pfz[i]; }
@@ -683,41 +749,38 @@ function updateGeometry() {
     for (let q = 0; q < TSPL; q++, fi++) { fPos[fi * 3] = trail[t * 2] + nucOff[q][0] * NR * 1.25; fPos[fi * 3 + 2] = trail[t * 2 + 1] + nucOff[q][1] * NR * 1.25; fVel[fi * 2] = fVel[fi * 2 + 1] = 0; fW[fi] = w; }
   }
   fieldGeo.attributes.position.needsUpdate = fieldGeo.attributes.aVel.needsUpdate = fieldGeo.attributes.aW.needsUpdate = true; fieldGeo.setDrawRange(0, fi);
-  // bead normals: average of the intact links either side
-  linkNormals();
-  for (let i = 0; i < NM; i++) {
-    const p = (i + NM - 1) % NM; let nx = 0, nz = 0;
-    if (!broken[i]) { nx += lnx[i]; nz += lnz[i]; } if (!broken[p]) { nx += lnx[p]; nz += lnz[p]; }
-    const l = Math.hypot(nx, nz); if (l > 1e-5) { pnx[i] = nx / l; pnz[i] = nz / l; }
-  }
-  const hw = MW * 0.5, yb = hNow + 0.012, wp = wall.pos, bp = band.pos;
+  const hw = MW * 0.5, yb = hNow + 0.012, wp = wall.pos, bp = band.pos, RW = 0.3;
   for (let i = 0; i < NM; i++) {
     const k = (i + 1) % NM, o = i * 12;
-    if (broken[i]) { for (let q = 0; q < 12; q++) { wp[o + q] = 0; bp[o + q] = 0; } continue; }
-    const ax = mx[i], az = mz[i], bx = mx[k], bz = mz[k];
-    bp[o] = ax - pnx[i] * hw; bp[o + 1] = yb; bp[o + 2] = az - pnz[i] * hw;
-    bp[o + 3] = ax + pnx[i] * hw; bp[o + 4] = yb; bp[o + 5] = az + pnz[i] * hw;
-    bp[o + 6] = bx - pnx[k] * hw; bp[o + 7] = yb; bp[o + 8] = bz - pnz[k] * hw;
-    bp[o + 9] = bx + pnx[k] * hw; bp[o + 10] = yb; bp[o + 11] = bz + pnz[k] * hw;
-    const ww = hw * 0.9;
-    wp[o] = ax + pnx[i] * ww; wp[o + 1] = yb; wp[o + 2] = az + pnz[i] * ww;
-    wp[o + 3] = ax + pnx[i] * ww; wp[o + 4] = 0; wp[o + 5] = az + pnz[i] * ww;
-    wp[o + 6] = bx + pnx[k] * ww; wp[o + 7] = yb; wp[o + 8] = bz + pnz[k] * ww;
-    wp[o + 9] = bx + pnx[k] * ww; wp[o + 10] = 0; wp[o + 11] = bz + pnz[k] * ww;
+    if (broken[i]) for (let q = 0; q < 12; q++) bp[o + q] = 0;
+    else {
+      const ax = mx[i], az = mz[i], bx = mx[k], bz = mz[k];
+      bp[o] = ax - pnx[i] * hw; bp[o + 1] = yb; bp[o + 2] = az - pnz[i] * hw;
+      bp[o + 3] = ax + pnx[i] * hw; bp[o + 4] = yb; bp[o + 5] = az + pnz[i] * hw;
+      bp[o + 6] = bx - pnx[k] * hw; bp[o + 7] = yb; bp[o + 8] = bz - pnz[k] * hw;
+      bp[o + 9] = bx + pnx[k] * hw; bp[o + 10] = yb; bp[o + 11] = bz + pnz[k] * hw;
+    }
+    if (!skirtLink(i)) { for (let q = 0; q < 12; q++) wp[o + q] = 0; continue; }
+    // standing up it is a wall from the beads down to the slide; peeled off, the same strip lies flat
+    for (let e = 0; e < 2; e++) {
+      const j = e ? k : i, fl = sFlat[j], off = RW * 0.5 * fl, oo = o + e * 6;
+      wp[oo] = sx[j] - snx[j] * off; wp[oo + 1] = yb * (1 - fl) + 0.02; wp[oo + 2] = sz[j] - snz[j] * off;
+      wp[oo + 3] = sx[j] + snx[j] * off; wp[oo + 4] = 0.012; wp[oo + 5] = sz[j] + snz[j] * off;
+    }
   }
   for (let i = 0; i < NM; i++) band.dmg.fill(damage[i], i * 4, i * 4 + 4);
   wall.geo.attributes.position.needsUpdate = band.geo.attributes.position.needsUpdate = band.geo.attributes.aDmg.needsUpdate = true;
   // cilia
   const cp = cilia.pos; let c = 0;
   for (let h = 0; h < hair.length; h++) {
-    const i = (h / HAIRS) | 0, k = (i + 1) % NM, hh = hair[h], s = broken[i] ? 0 : hh.s;
-    let x = mx[i] + (mx[k] - mx[i]) * s, z = mz[i] + (mz[k] - mz[i]) * s;
-    let nx = pnx[i] + (pnx[k] - pnx[i]) * s, nz = pnz[i] + (pnz[k] - pnz[i]) * s; const nl = Math.hypot(nx, nz) || 1; nx /= nl; nz /= nl;
-    x += nx * hw * 0.85; z += nz * hw * 0.85;
-    const base = Math.atan2(nz, nx) + hh.a, st = hh.len / HSEG; let y = hNow * 0.7;
+    const i = (h / HAIRS) | 0, k = (i + 1) % NM, hh = hair[h], s = skirtLink(i) ? hh.s : 0;
+    let x = sx[i] + (sx[k] - sx[i]) * s, z = sz[i] + (sz[k] - sz[i]) * s;
+    let nx = snx[i] + (snx[k] - snx[i]) * s, nz = snz[i] + (snz[k] - snz[i]) * s; const nl = Math.hypot(nx, nz) || 1; nx /= nl; nz /= nl;
+    const fl = sFlat[i]; x += nx * 0.13 * fl; z += nz * 0.13 * fl;
+    const base = Math.atan2(nz, nx) + hh.a, st = hh.len / HSEG * (1 - 0.35 * fl); let y = hNow * 0.7 * (1 - fl) + 0.012;
     for (let q = 0; q < HSEG; q++) {
       const t = (q + 0.5) / HSEG, ang = base + hh.curl * t + 0.35 * Math.sin(beatT * hh.sp + hh.ph - t * 2.5) * (0.3 + t) + hh.curl * 0.5 * death * t;
-      const x2 = x + Math.cos(ang) * st, z2 = z + Math.sin(ang) * st, y2 = hNow * 0.7 * (1 - (q + 1) / HSEG) ** 2 + 0.01;
+      const x2 = x + Math.cos(ang) * st, z2 = z + Math.sin(ang) * st, y2 = hNow * 0.7 * (1 - fl) * (1 - (q + 1) / HSEG) ** 2 + 0.01;
       cp[c++] = x; cp[c++] = y; cp[c++] = z; cp[c++] = x2; cp[c++] = y2; cp[c++] = z2; x = x2; z = z2; y = y2;
     }
   }
@@ -794,7 +857,8 @@ function frame() {
   time += 1 / 60; uTime.value = time;
   stepFrame();
   uFade.value = death; hNow = H * (1 - 0.62 * death); beatT += (1 - death) / 60;
-  cyto.position.y = hNow; cilia.obj.material.uniforms.uOpacity.value = 0.5 * (1 - 0.55 * death);
+  wallMesh.renderOrder = death > 0.35 ? 7.5 : 3; cilia.obj.renderOrder = death > 0.35 ? 7.6 : 4;
+  cyto.position.y = hNow; cilia.obj.material.uniforms.uOpacity.value = 0.5 * (1 - 0.25 * death);
   updateGeometry();
   // density + velocity
   renderer.setRenderTarget(fieldRT); renderer.setClearColor(0x000000, 0); renderer.clear(); renderer.render(fieldScene, quadCam);
@@ -810,5 +874,5 @@ function frame() {
 }
 resetSim();
 renderer.setAnimationLoop(frame);
-window.__lab = { step: () => { time += 1 / 60; stepFrame(); }, P, nuc, state: () => ({ ruptured, np, nc, intact: NM - broken.reduce((a, b) => a + b, 0), time }), mx, mz, rest: rest0, frame, reset: resetSim };
+window.__lab = { step: () => { time += 1 / 60; stepFrame(); }, P, nuc, state: () => ({ maxElong: Math.max(...elong).toFixed(2), death: death.toFixed(2), ruptured, np, nc, intact: NM - broken.reduce((a, b) => a + b, 0), time }), mx, mz, rest: rest0, frame, reset: resetSim };
 </script>
