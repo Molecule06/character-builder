@@ -34,13 +34,14 @@
   .meta { font-size: 0.68rem; letter-spacing: 0.08em; text-transform: uppercase; color: var(--ink-soft); text-align: right; }
   .scale { display: flex; flex-direction: column; align-items: flex-end; gap: 4px; font-size: 0.68rem; color: var(--ink-soft); }
   .scale i { display: block; width: 88px; height: 5px; border: 1px solid var(--rule); border-top: 0; }
-  button#again {
+  button#again, button#kill {
     pointer-events: auto; font: 500 0.72rem var(--font-data); letter-spacing: 0.04em;
     color: var(--ink); background: var(--label); border: 1px solid var(--rule); border-radius: 2px;
     padding: 8px 12px; cursor: pointer; backdrop-filter: blur(6px);
   }
-  button#again:hover { background: #fff; }
-  button#again:focus-visible { outline: 2px solid var(--stain); outline-offset: 2px; }
+  button#again:hover, button#kill:hover { background: #fff; }
+  button#again:focus-visible, button#kill:focus-visible { outline: 2px solid var(--stain); outline-offset: 2px; }
+  .btns { display: flex; gap: 8px; }
   .fail { position: absolute; inset: 0; display: grid; place-items: center; padding: 24px; text-align: center; font-size: 0.85rem; color: var(--ink); }
 </style>
 
@@ -49,9 +50,9 @@
     <div class="row top">
       <div>
         <h1 class="name">Membrane</h1>
-        <p class="note" id="note">Drag the nucleus to stir the cell. Lean on the wall and it stretches thin, flushes pink, then tears.</p>
+        <p class="note" id="note">Grab the cell anywhere and pull it about. Yank the wall hard, or double-click it, and it tears.</p>
       </div>
-      <button id="again" type="button">New specimen</button>
+      <div class="btns"><button id="kill" type="button">Kill</button><button id="again" type="button">New specimen</button></div>
     </div>
     <div class="row">
       <div class="meta" style="text-align:left">Specimen <span id="specimen">01</span> · violet stain · 400×</div>
@@ -64,328 +65,529 @@
 <script type="module">
 import * as THREE from 'https://cdn.jsdelivr.net/npm/three@0.180.0/build/three.module.js';
 
-/* An original take on the idea in grgrdvrt's Codevember sketch "Membrane":
-   a soft cell whose wall you can burst by shoving its nucleus around. */
+// ───────────────────────── simulation (2d, no rendering) ─────────────────────────
+// The cytoplasm is a grid fluid (semi-Lagrangian advection + pressure projection, after Stam's
+// "stable fluids"); a dye says where it is. The wall is a sprung chain of blocks that are solid
+// to the fluid, and holds its own area while the cell lives. Mechanic after grgrdvrt's "Membrane".
+const FW = 8, G = 128, HC = 2 * FW / G, G1 = G + 1, GP = G + 2, GN = G * G;
+const NM = 80, CELL_R = 3, MW = 0.3, RW = 0.17, NR = 0.74, REACH = 0.85;
+const ROPES = 2, RLEN = 44, RLINK = 0.075, TEAR_AT = 1.2;   // a link pulled past this many times its length gives way
+const smooth = (t) => { t = t < 0 ? 0 : t > 1 ? 1 : t; return t * t * (3 - 2 * t); };
+const cellX = (i) => -FW + (i + 0.5) * HC, cellAt = (x) => (x + FW) / HC - 0.5;
+function makeRand(seed) { let s = (seed | 0) || 1; return () => { s ^= s << 13; s ^= s >>> 17; s ^= s << 5; return ((s >>> 0) % 1000003) / 1000003; }; }
+function bil(f, w, h, fx, fy) {
+  fx = fx < 0 ? 0 : fx > w - 1.001 ? w - 1.001 : fx; fy = fy < 0 ? 0 : fy > h - 1.001 ? h - 1.001 : fy;
+  const i = fx | 0, j = fy | 0, tx = fx - i, ty = fy - j, k = j * w + i;
+  return (f[k] * (1 - tx) + f[k + 1] * tx) * (1 - ty) + (f[k + w] * (1 - tx) + f[k + w + 1] * tx) * ty;
+}
+function vnoise2(x, y, o) {
+  const h = (i, j) => { const t = Math.sin(i * 91.7 + j * 271.3 + o * 53.1) * 15731.743; return t - Math.floor(t); };
+  const i = Math.floor(x), j = Math.floor(y), a = x - i, b = y - j, sa = a * a * (3 - 2 * a), sb = b * b * (3 - 2 * b);
+  return (h(i, j) * (1 - sa) + h(i + 1, j) * sa) * (1 - sb) + (h(i, j + 1) * (1 - sa) + h(i + 1, j + 1) * sa) * sb;
+}
 
-// ───────────────────────── constants ─────────────────────────
-const HX = 9, HZ = 6.75;            // half extents of the simulated slide (world units)
-const FW = 1024, FH = 768;          // fluid field resolution
-const H = 0.3;                      // height of the cell slab
-const NM = 84;                      // membrane beads
-const MW = 0.27;                    // membrane band width
-const NR = 0.52;                    // nucleus radius
-const PR = 0.115;                   // cytoplasm particle radius
-const MAXP = 720;
-const ROPES = 2, RLEN = 52, RLINK = 0.07, RRAD = 0.045;
-const HAIRS = 4, HSEG = 6;
-const TENSION = 0.95;                // the wall is always slightly too short, so it squeezes the cytoplasm
-const P = {                          // tunables
-  sub: 3, iter: 4,
-  nSpeed: 0.036,                     // nucleus travel per substep while dragged
-  mVisc: 0.88, pVisc: 0.96,           // how much of a correction survives the medium's drag
-  creepFrom: 1.07, creep: 0.0026,     // a wall stretched past creepFrom grows longer and thinner, for good
-  tearAt: 1.5,
-  tow: 0.7,                         // share of a push on the wall that moves the whole cell instead                       // ...and gives way once it has thinned this much
-};
+function makeFluid(seed) {
+  const u = new Float32Array(G1 * G), v = new Float32Array(G * G1), u2 = new Float32Array(G1 * G), v2 = new Float32Array(G * G1);
+  const p = new Float32Array(GP * GP), rhs = new Float32Array(GN), src = new Float32Array(GN), inv = new Float32Array(GN);
+  const wl = new Uint8Array(GN), wr = new Uint8Array(GN), wd = new Uint8Array(GN), wu = new Uint8Array(GN);
+  const solid = new Uint8Array(GN), sux = new Float32Array(GN), suy = new Float32Array(GN), inCell = new Uint8Array(GN);
+  const c = new Float32Array(GN), ax = new Float32Array(GN), ay = new Float32Array(GN), bx = new Float32Array(GN), by = new Float32Array(GN);
+  const fields = [c, ax, ay, bx, by], tmp = fields.map(() => new Float32Array(GN));
+  const velU = (x, y) => bil(u, G1, G, (x + FW) / HC, (y + FW) / HC - 0.5);
+  const velV = (x, y) => bil(v, G, G1, (x + FW) / HC - 0.5, (y + FW) / HC);
+  const dye = (x, y) => bil(c, G, G, cellAt(x), cellAt(y));
+  const pressure = (x, y) => bil(p, GP, GP, cellAt(x) + 1, cellAt(y) + 1);
 
-// ───────────────────────── simulation state ─────────────────────────
-const mx = new Float32Array(NM), mz = new Float32Array(NM), msx = new Float32Array(NM), msz = new Float32Array(NM);
-const rest0 = new Float32Array(NM), rest = new Float32Array(NM), bend = new Float32Array(NM);
-const broken = new Uint8Array(NM), damage = new Float32Array(NM), elong = new Float32Array(NM), breakAt = new Float32Array(NM);
-// the skirt: the striped outer layer that carries the cilia. It rides on the beads until the cell dies, then peels off in ribbons.
-const sx = new Float32Array(NM), sz = new Float32Array(NM), svx = new Float32Array(NM), svz = new Float32Array(NM);
-const snx = new Float32Array(NM), snz = new Float32Array(NM), sFlat = new Float32Array(NM), sPeelAt = new Float32Array(NM);
-const sAtt = new Uint8Array(NM), sBrk = new Uint8Array(NM);
-let tearIdx = 0;
-const lnx = new Float32Array(NM), lnz = new Float32Array(NM), pnx = new Float32Array(NM), pnz = new Float32Array(NM);
-const px = new Float32Array(MAXP), pz = new Float32Array(MAXP), psx = new Float32Array(MAXP), psz = new Float32Array(MAXP);
-const pfx = new Float32Array(MAXP), pfz = new Float32Array(MAXP), prad = new Float32Array(MAXP), prope = new Int8Array(MAXP);
-let np = 0, nc = 0;
-const nuc = { x: 0, z: 0, tx: 0, tz: 0, drag: false, roll: 0 };
-let ruptured = false, ruptureT = 0, time = 0, specimen = 0, death = 0, beatT = 0, hNow = H;
-
-function resetSim() {
-  specimen++;
-  const el = document.getElementById('specimen'); if (el) el.textContent = String(specimen).padStart(2, '0');
-  ruptured = false; ruptureT = 0; death = 0; hNow = H;
-  // a bean-shaped outline, a little different every time
-  const A = 2.85 + Math.random() * 0.35, B = 1.45 + Math.random() * 0.2, K = 0.1 + Math.random() * 0.16;
-  const rot = (Math.random() - 0.5) * 0.5, flip = Math.random() < 0.5 ? -1 : 1;
-  const cr = Math.cos(rot), sr = Math.sin(rot);
-  const D = 1024, dx = new Float32Array(D + 1), dz = new Float32Array(D + 1), dl = new Float32Array(D + 1);
-  for (let i = 0; i <= D; i++) {
-    const t = i / D * Math.PI * 2;
-    const x = A * Math.cos(t) * (1 + 0.06 * Math.cos(t)), z = flip * (B * Math.sin(t) + K * Math.cos(2 * t) + 0.2) * 1;
-    dx[i] = x * cr - z * sr; dz[i] = x * sr + z * cr;
-    dl[i] = i ? dl[i - 1] + Math.hypot(dx[i] - dx[i - 1], dz[i] - dz[i - 1]) : 0;
-  }
-  let j = 0;
-  for (let i = 0; i < NM; i++) {
-    const s = dl[D] * i / NM;
-    while (dl[j + 1] < s) j++;
-    const f = (s - dl[j]) / (dl[j + 1] - dl[j]);
-    mx[i] = dx[j] + (dx[j + 1] - dx[j]) * f; mz[i] = dz[j] + (dz[j + 1] - dz[j]) * f;
-  }
-  // keep the winding counter-clockwise in (x, z) so outward normals are (tz, -tx)
-  let area = 0;
-  for (let i = 0; i < NM; i++) { const k = (i + 1) % NM; area += mx[i] * mz[k] - mx[k] * mz[i]; }
-  if (area < 0) { mx.reverse(); mz.reverse(); }
-  for (let i = 0; i < NM; i++) {
-    const k = (i + 1) % NM, k2 = (i + 2) % NM;
-    rest0[i] = Math.hypot(mx[k] - mx[i], mz[k] - mz[i]); rest[i] = rest0[i] * TENSION;
-    bend[i] = Math.hypot(mx[k2] - mx[i], mz[k2] - mz[i]);
-    broken[i] = 0; damage[i] = 0; elong[i] = 1; breakAt[i] = 1e9;
-    sAtt[i] = 1; sBrk[i] = 0; sFlat[i] = 0; svx[i] = svz[i] = 0; sPeelAt[i] = 1e9;
-  }
-  const inside = (x, z) => {
-    let c = false;
-    for (let i = 0, k = NM - 1; i < NM; k = i++)
-      if ((mz[i] > z) !== (mz[k] > z) && x < (mx[k] - mx[i]) * (z - mz[i]) / (mz[k] - mz[i]) + mx[i]) c = !c;
-    return c;
-  };
-  const edgeDist = (x, z) => {
-    let best = 1e9;
-    for (let i = 0; i < NM; i++) {
-      const k = (i + 1) % NM, ex = mx[k] - mx[i], ez = mz[k] - mz[i];
-      let t = ((x - mx[i]) * ex + (z - mz[i]) * ez) / (ex * ex + ez * ez); t = Math.max(0, Math.min(1, t));
-      best = Math.min(best, Math.hypot(x - mx[i] - ex * t, z - mz[i] - ez * t));
+  // which cells are wall (and how the wall there is moving), and which lie inside the ring
+  const xs = [];
+  function rasterize(mx, my, mvx, mvy, linkOn, nuc) {
+    solid.fill(0); inCell.fill(0);
+    for (let j = 0; j < G; j++) {
+      const y = cellX(j); xs.length = 0;
+      for (let a = 0, b = NM - 1; a < NM; b = a++) if ((my[a] > y) !== (my[b] > y)) xs.push(mx[a] + (y - my[a]) * (mx[b] - mx[a]) / (my[b] - my[a]));
+      xs.sort((a, b) => a - b);
+      for (let q = 0; q + 1 < xs.length; q += 2) {
+        const i0 = Math.max(0, Math.ceil(cellAt(xs[q]))), i1 = Math.min(G - 1, Math.floor(cellAt(xs[q + 1])));
+        for (let i = i0; i <= i1; i++) inCell[j * G + i] = 1;
+      }
     }
-    return best;
-  };
-  // nucleus somewhere roomy
-  for (let tries = 0; tries < 400; tries++) {
-    const x = (Math.random() - 0.5) * 3, z = (Math.random() - 0.5) * 1.6;
-    if (inside(x, z) && edgeDist(x, z) > NR + MW * 0.5 + 0.2) { nuc.x = x; nuc.z = z; break; }
+    const stamp = (x0, y0, x1, y1, r, vx0, vy0, vx1, vy1) => {
+      const sx = x1 - x0, sy = y1 - y0, s2 = sx * sx + sy * sy;
+      const i0 = Math.max(0, Math.floor(cellAt(Math.min(x0, x1) - r))), i1 = Math.min(G - 1, Math.ceil(cellAt(Math.max(x0, x1) + r)));
+      const j0 = Math.max(0, Math.floor(cellAt(Math.min(y0, y1) - r))), j1 = Math.min(G - 1, Math.ceil(cellAt(Math.max(y0, y1) + r)));
+      for (let j = j0; j <= j1; j++) for (let i = i0; i <= i1; i++) {
+        const qx = cellX(i) - x0, qy = cellX(j) - y0;
+        let t = s2 > 1e-9 ? (qx * sx + qy * sy) / s2 : 0; t = t < 0 ? 0 : t > 1 ? 1 : t;
+        const dx = qx - sx * t, dy = qy - sy * t; if (dx * dx + dy * dy > r * r) continue;
+        const k = j * G + i; solid[k] = 1; sux[k] = vx0 + (vx1 - vx0) * t; suy[k] = vy0 + (vy1 - vy0) * t;
+      }
+    };
+    for (let a = 0; a < NM; a++) {
+      const b = (a + 1) % NM;
+      if (linkOn[a]) stamp(mx[a], my[a], mx[b], my[b], RW, mvx[a], mvy[a], mvx[b], mvy[b]);
+      else stamp(mx[a], my[a], mx[a], my[a], RW, mvx[a], mvy[a], mvx[a], mvy[a]);
+    }
+    stamp(nuc.x, nuc.y, nuc.x, nuc.y, nuc.r, nuc.vx, nuc.vy, nuc.vx, nuc.vy);
   }
-  nuc.tx = nuc.fx = nuc.x; nuc.tz = nuc.fz = nuc.z; nuc.drag = false;
-  if (typeof trail !== 'undefined') for (let i = 0; i < TRAIL; i++) { trail[i * 2] = nuc.x; trail[i * 2 + 1] = nuc.z; }
-  // pack the cytoplasm on a jittered hex grid
-  np = 0;
-  const s = PR * 2 * 0.9, margin = MW * 0.5 + PR;
-  for (let r = 0, z = -4; z < 4; z += s * 0.866, r++) for (let x = -5 + (r & 1) * s * 0.5; x < 5; x += s) {
-    if (np >= MAXP - ROPES * RLEN) break;
-    if (!inside(x, z) || edgeDist(x, z) < margin || Math.hypot(x - nuc.x, z - nuc.z) < NR + PR) continue;
-    px[np] = x + (Math.random() - 0.5) * 0.03; pz[np] = z + (Math.random() - 0.5) * 0.03; prad[np] = PR; prope[np] = -1; np++;
+  function enforceWalls() {
+    for (let j = 0; j < G; j++) for (let i = 1; i < G; i++) {
+      const a = j * G + i - 1, b = a + 1;
+      if (solid[a] || solid[b]) u[j * G1 + i] = solid[a] && solid[b] ? (sux[a] + sux[b]) / 2 : solid[a] ? sux[a] : sux[b];
+    }
+    for (let j = 1; j < G; j++) for (let i = 0; i < G; i++) {
+      const a = (j - 1) * G + i, b = a + G;
+      if (solid[a] || solid[b]) v[j * G + i] = solid[a] && solid[b] ? (suy[a] + suy[b]) / 2 : solid[a] ? suy[a] : suy[b];
+    }
   }
-  nc = np;
-  // tangled filaments
+  function advectVelocity(dt) {
+    for (let j = 0; j < G; j++) for (let i = 0; i <= G; i++) { const x = -FW + i * HC, y = cellX(j); u2[j * G1 + i] = velU(x - dt * velU(x, y), y - dt * velV(x, y)); }
+    for (let j = 0; j <= G; j++) for (let i = 0; i < G; i++) { const x = cellX(i), y = -FW + j * HC; v2[j * G + i] = velV(x - dt * velU(x, y), y - dt * velV(x, y)); }
+    u.set(u2); v.set(v2);
+  }
+  // thick where there is cytoplasm: velocity relaxes towards its neighbours'
+  function viscosity(k) {
+    u2.set(u); v2.set(v);
+    for (let j = 1; j < G - 1; j++) for (let i = 1; i < G; i++) {
+      const f = j * G1 + i, w = k * (c[j * G + i - 1] + c[j * G + i]) * 0.5; if (w <= 0) continue;
+      u[f] += ((u2[f - 1] + u2[f + 1] + u2[f - G1] + u2[f + G1]) * 0.25 - u2[f]) * Math.min(1, w);
+    }
+    for (let j = 1; j < G; j++) for (let i = 1; i < G - 1; i++) {
+      const f = j * G + i, w = k * (c[f - G] + c[f]) * 0.5; if (w <= 0) continue;
+      v[f] += ((v2[f - 1] + v2[f + 1] + v2[f - G] + v2[f + G]) * 0.25 - v2[f]) * Math.min(1, w);
+    }
+  }
+  // incompressible apart from the sources: red-black over-relaxation, warm-started from the last
+  // step, walls closed, the grid's edge open
+  function project(iters) {
+    const h2 = HC * HC;
+    for (let j = 0; j < G; j++) for (let i = 0; i < G; i++) {
+      const k = j * G + i, P = (j + 1) * GP + i + 1;
+      if (solid[k]) { p[P] = 0; inv[k] = 0; continue; }
+      wl[k] = i > 0 && solid[k - 1] ? 0 : 1; wr[k] = i < G - 1 && solid[k + 1] ? 0 : 1;
+      wd[k] = j > 0 && solid[k - G] ? 0 : 1; wu[k] = j < G - 1 && solid[k + G] ? 0 : 1;
+      const n = wl[k] + wr[k] + wd[k] + wu[k]; inv[k] = n ? 1 / n : 0;
+      rhs[k] = ((u[j * G1 + i + 1] - u[j * G1 + i] + v[(j + 1) * G + i] - v[k]) / HC - src[k]) * h2;
+      p[P] *= 0.985;
+    }
+    for (let it = 0; it < iters; it++) for (let red = 0; red < 2; red++) for (let j = 0; j < G; j++) {
+      for (let i = (j + red) & 1; i < G; i += 2) {
+        const k = j * G + i; if (!inv[k]) continue;
+        const P = (j + 1) * GP + i + 1;
+        p[P] += 1.72 * ((p[P - 1] * wl[k] + p[P + 1] * wr[k] + p[P - GP] * wd[k] + p[P + GP] * wu[k] - rhs[k]) * inv[k] - p[P]);
+      }
+    }
+    for (let j = 0; j < G; j++) for (let i = 0; i <= G; i++) {
+      if ((i > 0 && solid[j * G + i - 1]) || (i < G && solid[j * G + i])) continue;
+      const P = (j + 1) * GP + i; u[j * G1 + i] -= (p[P + 1] - p[P]) / HC;
+    }
+    for (let j = 0; j <= G; j++) for (let i = 0; i < G; i++) {
+      if ((j > 0 && solid[(j - 1) * G + i]) || (j < G && solid[j * G + i])) continue;
+      const P = j * GP + i + 1; v[j * G + i] -= (p[P + GP] - p[P]) / HC;
+    }
+  }
+  // dye and the two sets of carried coordinates ride the flow; nothing is drawn out of a wall
+  function advectScalars(dt, sharpen) {
+    // only over the box round the cytoplasm: there is nothing to carry anywhere else
+    let bi0 = G, bi1 = -1, bj0 = G, bj1 = -1;
+    for (let j = 0; j < G; j++) for (let i = 0; i < G; i++) if (c[j * G + i] > 1e-4) { if (i < bi0) bi0 = i; if (i > bi1) bi1 = i; if (j < bj0) bj0 = j; if (j > bj1) bj1 = j; }
+    if (bi1 < 0) return;
+    bi0 = Math.max(0, bi0 - 6); bi1 = Math.min(G - 1, bi1 + 6); bj0 = Math.max(0, bj0 - 6); bj1 = Math.min(G - 1, bj1 + 6);
+    for (let f = 0; f < 5; f++) tmp[f].set(fields[f]);
+    for (let j = bj0; j <= bj1; j++) for (let i = bi0; i <= bi1; i++) {
+      const k = j * G + i;
+      if (solid[k]) { for (let f = 0; f < 5; f++) tmp[f][k] = fields[f][k]; continue; }
+      const x = cellX(i), y = cellX(j), uc = (u[j * G1 + i] + u[j * G1 + i + 1]) * 0.5, vc = (v[k] + v[k + G]) * 0.5;
+      const hx = x - 0.5 * dt * uc, hy = y - 0.5 * dt * vc, sx = x - dt * velU(hx, hy), sy = y - dt * velV(hx, hy);
+      let fx = cellAt(sx), fy = cellAt(sy);
+      fx = fx < 0 ? 0 : fx > G - 1.001 ? G - 1.001 : fx; fy = fy < 0 ? 0 : fy > G - 1.001 ? G - 1.001 : fy;
+      const i0 = fx | 0, j0 = fy | 0, tx = fx - i0, ty = fy - j0, q = j0 * G + i0;
+      const w00 = solid[q] ? 0 : (1 - tx) * (1 - ty), w10 = solid[q + 1] ? 0 : tx * (1 - ty), w01 = solid[q + G] ? 0 : (1 - tx) * ty, w11 = solid[q + G + 1] ? 0 : tx * ty;
+      const W = w00 + w10 + w01 + w11;
+      if (W < 1e-4) { for (let f = 0; f < 5; f++) tmp[f][k] = fields[f][k]; continue; }
+      const ox = sx - x, oy = sy - y;
+      for (let f = 0; f < 5; f++) {
+        const F = fields[f]; let s = (F[q] * w00 + F[q + 1] * w10 + F[q + G] * w01 + F[q + G + 1] * w11) / W;
+        if (f === 1 || f === 3) s += ox; else if (f === 2 || f === 4) s += oy;
+        tmp[f][k] = s;
+      }
+    }
+    for (let f = 0; f < 5; f++) fields[f].set(tmp[f]);
+    // keep an edge on the spilt dye instead of letting it blur away step after step
+    if (sharpen > 0) for (let k = 0; k < GN; k++) { const s = c[k]; if (s > 0.02 && s < 0.98) c[k] += (s * s * (3 - 2 * s) - s) * sharpen; }
+  }
+  // for the look: dye reaches in under the blocks and under the nucleus
+  function fillWalls(any) {
+    for (let pass = 0; pass < 6; pass++) for (let k = G + 1; k < GN - G - 1; k++) {
+      if (!solid[k]) continue;
+      if (!inCell[k] && !any) { c[k] = 0; continue; }
+      let s = 0, m = 0;
+      for (let e = 0; e < 4; e++) {
+        const q = e === 0 ? k - 1 : e === 1 ? k + 1 : e === 2 ? k - G : k + G;
+        if ((solid[q] && pass === 0) || (!inCell[q] && !any)) continue;
+        s += c[q]; m++;
+      }
+      if (m) c[k] = s / m;
+    }
+  }
+  // the slide has a grain: spilt cytoplasm creeps along it, so its edge frays into streaks
+  const gc = new Float32Array(GN), gs = new Float32Array(GN), gk = new Float32Array(GN), o = (seed % 613) * 0.37;
+  for (let j = 0; j < G; j++) for (let i = 0; i < G; i++) {
+    const x = cellX(i), y = cellX(j), th = 6.283 * (vnoise2(x * 0.17, y * 0.17, o) + 0.35 * vnoise2(x * 0.5 + 9, y * 0.5, o + 2));
+    const k = j * G + i; gc[k] = Math.cos(th); gs[k] = Math.sin(th);
+    const along = x * gc[k] + y * gs[k], across = -x * gs[k] + y * gc[k];
+    gk[k] = 0.05 + 0.95 * smooth((vnoise2(across * 5.5, along * 0.7, o + 5) - 0.32) / 0.4);
+  }
+  function creep(rate) {
+    const s = tmp[0]; s.set(c);
+    for (let j = 1; j < G - 1; j++) for (let i = 1; i < G - 1; i++) {
+      const k = j * G + i; if (solid[k] || inCell[k]) continue;
+      c[k] += rate * gk[k] * (bil(s, G, G, i + gc[k], j + gs[k]) + bil(s, G, G, i - gc[k], j - gs[k]) - 2 * s[k]);
+    }
+  }
+  const PERIOD = 6; let phA = -1, phB = -1;
+  function resetCoords(t) {
+    const a = Math.floor(t / PERIOD), b = Math.floor(t / PERIOD + 0.5);
+    if (a !== phA) { ax.fill(0); ay.fill(0); phA = a; } if (b !== phB) { bx.fill(0); by.fill(0); phB = b; }
+  }
+  const weightA = (t) => 1 - Math.abs(2 * ((t / PERIOD) % 1) - 1);
+  return { u, v, c, ax, ay, bx, by, solid, inCell, src, velU, velV, dye, pressure, rasterize, enforceWalls, advectVelocity, viscosity, project, advectScalars, fillWalls, creep, resetCoords, weightA };
+}
+
+function polyArea(X, Y) { let a = 0; for (let i = 0, n = X.length; i < n; i++) { const j = (i + 1) % n; a += X[i] * Y[j] - X[j] * Y[i]; } return a / 2; }
+function polyInside(X, Y, x, y) {
+  let c = false;
+  for (let i = 0, n = X.length, j = n - 1; i < n; j = i++) if ((Y[i] > y) !== (Y[j] > y) && x < (X[j] - X[i]) * (y - Y[i]) / (Y[j] - Y[i]) + X[i]) c = !c;
+  return c;
+}
+function ringDist(X, Y, x, y) {
+  let best = Infinity;
+  for (let i = 0, n = X.length; i < n; i++) {
+    const j = (i + 1) % n, sx = X[j] - X[i], sy = Y[j] - Y[i];
+    const t = Math.max(0, Math.min(1, ((x - X[i]) * sx + (y - Y[i]) * sy) / (sx * sx + sy * sy + 1e-12)));
+    best = Math.min(best, Math.hypot(x - X[i] - sx * t, y - Y[i] - sy * t));
+  }
+  return best;
+}
+function segsCross(ax, ay, bx, by, cx, cy, dx, dy) {
+  const den = (bx - ax) * (dy - cy) - (by - ay) * (dx - cx); if (den === 0) return false;
+  const t = ((cx - ax) * (dy - cy) - (cy - ay) * (dx - cx)) / den, s = ((cx - ax) * (by - ay) - (cy - ay) * (bx - ax)) / den;
+  return t > 0 && t < 1 && s > 0 && s < 1;
+}
+// the slow current of the medium the cell lies in (divergence-free)
+function mediumFlow(x, y, t, out) {
+  const k1 = 0.45, k2 = 0.85, a1 = k1 * x + 0.05 * t, b1 = k1 * y - 0.037 * t + 1.3, a2 = k2 * (0.8 * x - 0.6 * y) - 0.03 * t + 4, b2 = k2 * (0.6 * x + 0.8 * y) + 0.043 * t;
+  out[0] = 0.07 * (-Math.sin(a1) * Math.sin(b1) + 0.5 * (-Math.cos(a2) * Math.sin(b2) * 0.6 + Math.sin(a2) * Math.cos(b2) * 0.8));
+  out[1] = -0.07 * (Math.cos(a1) * Math.cos(b1) + 0.5 * (Math.cos(a2) * Math.sin(b2) * 0.8 + Math.sin(a2) * Math.cos(b2) * 0.6));
+  return out;
+}
+// the living cytoplasm streams round in two slow counter-turning eddies
+function cyclosis(x, y, t, out) {
+  const ex = Math.cos(t * 0.11) * 1.2, ey = Math.sin(t * 0.11) * 1.2; let sx = 0, sy = 0;
+  for (let sg = -1; sg <= 1; sg += 2) { const rx = x - ex * sg, ry = y - ey * sg, f = sg * 0.45 * Math.exp(-(rx * rx + ry * ry) / 3); sx -= ry * f; sy += rx * f; }
+  const a = 1.3 * x + 0.21 * t, b = 1.1 * y - 0.17 * t + 2;
+  out[0] = sx - 0.077 * Math.sin(a) * Math.sin(b); out[1] = sy - 0.091 * Math.cos(a) * Math.cos(b);
+  return out;
+}
+
+function createSim(seed) {
+  const rand = makeRand(seed * 7919 + 13), fluid = makeFluid(seed);
+  const { u, v, c, solid, inCell, src } = fluid;
+  const mx = new Float32Array(NM), my = new Float32Array(NM), mpx = new Float32Array(NM), mpy = new Float32Array(NM);
+  const mvx = new Float32Array(NM), mvy = new Float32Array(NM), m0x = new Float32Array(NM), m0y = new Float32Array(NM), msx = new Float32Array(NM), msy = new Float32Array(NM);
+  const linkRest = new Float32Array(NM), bendRest = new Float32Array(NM), linkOn = new Uint8Array(NM).fill(1), push = new Float32Array(NM), raw = new Float32Array(NM);
+  { // a lobed outline, blocks spaced evenly along it
+    const ph = [rand() * 6.28, rand() * 6.28, rand() * 6.28], M = 1536, px = [], py = [], cl = [0];
+    for (let k = 0; k <= M; k++) {
+      const a = k / M * Math.PI * 2, r = CELL_R * (1 + 0.14 * Math.sin(2 * a + ph[0]) + 0.07 * Math.sin(3 * a + ph[1]) + 0.04 * Math.sin(5 * a + ph[2]));
+      px.push(Math.cos(a) * r); py.push(Math.sin(a) * r); if (k) cl.push(cl[k - 1] + Math.hypot(px[k] - px[k - 1], py[k] - py[k - 1]));
+    }
+    for (let i = 0, k = 0; i < NM; i++) {
+      const want = i / NM * cl[M]; while (cl[k + 1] < want) k++;
+      const f = (want - cl[k]) / (cl[k + 1] - cl[k]);
+      mx[i] = mpx[i] = px[k] + (px[k + 1] - px[k]) * f; my[i] = mpy[i] = py[k] + (py[k + 1] - py[k]) * f;
+    }
+  }
+  for (let i = 0; i < NM; i++) { const j = (i + 1) % NM; linkRest[i] = Math.hypot(mx[j] - mx[i], my[j] - my[i]); }
+  for (let i = 0; i < NM; i++) bendRest[i] = linkRest[i] + linkRest[(i + 1) % NM];
+  const L = linkRest.reduce((a, b) => a + b) / NM, area0 = polyArea(mx, my);
+  const lobes = [2, 3, 4, 5].map((k) => ({ k, w: (rand() - 0.5) * 0.5, ph: rand() * 6.28, a: 1 / k }));
+  const roam = []; for (let i = 0; i < NM; i++) roam.push({ ph: rand() * 6.28, w: (rand() - 0.5) * 0.5, w2: 0.2 + rand() * 0.3, v: 0.5 + rand() * 0.5 });
+
+  // content: the nucleus (a wall in the flow) and vesicles (carried by it)
+  const bodies = [{ kind: 0, r: NR, r0: NR, m: 25, solid: true }];
+  for (let i = 0, n = 9 + Math.floor(rand() * 5); i < n; i++) bodies.push({ kind: 1, r: 0.13 + rand() * 0.16, m: 2, solid: false, seed: rand() });
+  { const a0 = rand() * 6.28, placed = [];
+    for (const b of bodies) {
+      for (let k = 0; k < 200; k++) {
+        const rr = b.solid ? rand() * 0.5 : Math.sqrt(rand()) * (CELL_R * 0.72 - 0.4 - b.r), aa = b.solid ? a0 : rand() * 6.28;
+        b.x = Math.cos(aa) * rr; b.y = Math.sin(aa) * rr;
+        if (polyInside(mx, my, b.x, b.y) && ringDist(mx, my, b.x, b.y) > b.r + 0.3 && placed.every((q) => Math.hypot(q.x - b.x, q.y - b.y) > q.r + b.r + 0.08)) break;
+      }
+      b.px = b.x; b.py = b.y; b.vx = b.vy = 0; b.angle = rand() * 6.28; placed.push(b);
+    } }
+  const nuc = bodies[0];
+  // small inclusions and tangled filaments: passengers in the flow
+  const bits = [];
+  for (let i = 0; i < 46; i++) {
+    let x = 0, y = 0;
+    for (let k = 0; k < 60; k++) { const a = rand() * 6.28, r = Math.sqrt(rand()) * CELL_R * 1.1; x = Math.cos(a) * r; y = Math.sin(a) * r; if (polyInside(mx, my, x, y) && ringDist(mx, my, x, y) > 0.4 && Math.hypot(x - nuc.x, y - nuc.y) > nuc.r + 0.1) break; }
+    const t = rand(); bits.push({ x, y, type: t < 0.3 ? 1 : t < 0.68 ? 2 : 3, seed: rand(), size: 0 });
+  }
+  const rx = new Float32Array(ROPES * RLEN), ry = new Float32Array(ROPES * RLEN);
   for (let r = 0; r < ROPES; r++) {
-    let cx = 0, cz = 0;
-    for (let tries = 0; tries < 200; tries++) {
-      const k = (Math.random() * nc) | 0; cx = px[k]; cz = pz[k];
-      if (edgeDist(cx, cz) > 0.75 && Math.hypot(cx - nuc.x, cz - nuc.z) > NR + 0.6) break;
-    }
-    let x = cx, z = cz, a = Math.random() * 6.28;
+    let cx = 0, cy = 0;
+    for (let k = 0; k < 80; k++) { const a = rand() * 6.28, q = rand() * CELL_R * 0.6; cx = Math.cos(a) * q; cy = Math.sin(a) * q; if (ringDist(mx, my, cx, cy) > 0.9 && Math.hypot(cx - nuc.x, cy - nuc.y) > nuc.r + 0.55) break; }
+    let x = cx, y = cy, a = rand() * 6.28;
     for (let i = 0; i < RLEN; i++) {
-      px[np] = x; pz[np] = z; prad[np] = RRAD; prope[np] = r; np++;
-      a += (Math.random() - 0.5) * 1.3;
-      if (Math.hypot(x - cx, z - cz) > 0.42) a = Math.atan2(cz - z, cx - x) + (Math.random() - 0.5) * 1.2;
-      x += Math.cos(a) * RLINK; z += Math.sin(a) * RLINK;
+      rx[r * RLEN + i] = x; ry[r * RLEN + i] = y; a += (rand() - 0.5) * 1.3;
+      if (Math.hypot(x - cx, y - cy) > 0.42) a = Math.atan2(cy - y, cx - x) + (rand() - 0.5) * 1.2;
+      x += Math.cos(a) * RLINK; y += Math.sin(a) * RLINK;
     }
   }
-  for (let i = 0; i < np; i++) { pfx[i] = px[i]; pfz[i] = pz[i]; }
-  if (typeof onReset === 'function') onReset();
-}
 
-function linkNormals() {
-  for (let i = 0; i < NM; i++) {
-    const k = (i + 1) % NM, ex = mx[k] - mx[i], ez = mz[k] - mz[i], l = Math.hypot(ex, ez) || 1e-6;
-    lnx[i] = ez / l; lnz[i] = -ex / l;
+  fluid.rasterize(mx, my, mvx, mvy, linkOn, nuc);
+  for (let k = 0; k < GN; k++) c[k] = inCell[k] ? 1 : 0;
+  fluid.fillWalls(false);
+  const curX = new Float32Array(GN), curY = new Float32Array(GN), strX = new Float32Array(GN), strY = new Float32Array(GN), o2 = [0, 0];
+  let fieldsAt = -9;
+  const frame = { x: 0, y: 0, vx: 0, vy: 0 };
+  function updateFields(t) {
+    for (let j = 0; j < G; j++) for (let i = 0; i < G; i++) {
+      const k = j * G + i, x = cellX(i), y = cellX(j);
+      mediumFlow(x, y, t, o2); curX[k] = o2[0]; curY[k] = o2[1];
+      cyclosis(x - frame.x, y - frame.y, t, o2); strX[k] = o2[0]; strY[k] = o2[1];
+    }
+    fieldsAt = t;
   }
-}
+  const S = { mx, my, linkOn, linkRest, bodies, nuc, bits, rx, ry, fluid, frame, L, time: 0, dying: -1, tearAt: -1, grabbed: false };
+  let grab = null;
 
-function breakLink(i) {
-  if (broken[i]) return;
-  broken[i] = 1;
-  if (ruptured) return;
-  ruptured = true; ruptureT = time; tearIdx = i;
-  // the skirt peels away from the tear in both directions, splitting into long ribbons as it goes
-  let run = 0, len = 9 + Math.random() * 12;
-  for (let a = 0; a < NM; a++) {
-    const k = (i + 1 + a) % NM, d = Math.min(a, NM - 1 - a);
-    sPeelAt[k] = 3.2 + d * 0.16 + Math.random() * 0.5;
-    if (++run > len) { sBrk[k] = 1; run = 0; len = 9 + Math.random() * 14; }
-  }
-  // the bead chain comes apart later: a few long strands, and stretches that crumble into clumps of two to four
-  let k = i, crumble = false, left = 0;
-  for (let a = 1; a < NM; a++) {
-    k = (i + a) % NM;
-    if (left-- <= 0) { crumble = !crumble; left = crumble ? 5 + Math.random() * 8 : 10 + Math.random() * 14; if (!crumble) breakAt[k] = 5 + Math.random() * 5; }
-    if (crumble && Math.random() < 0.42) breakAt[k] = 5 + Math.random() * 6;
-  }
-}
-
-function substep() {
-  const holds = ruptured ? Math.max(0, 1 - (time - ruptureT - 4.5) / 3) : 1;   // how much the wall still contains the cytoplasm
-  msx.set(mx); msz.set(mz); psx.set(px); psz.set(pz);
-  if (nuc.drag) {
-    const dx = nuc.tx - nuc.x, dz = nuc.tz - nuc.z, l = Math.hypot(dx, dz);
-    if (l > 1e-5) { const st = Math.min(l * 0.5, P.nSpeed); nuc.x += dx / l * st; nuc.z += dz / l * st; nuc.roll += dx / l * st * 0.6; }
-  }
-  const minNM = NR + MW * 0.42;
-  for (let it = 0; it < P.iter; it++) {
-    // membrane links
+  function tear(x, y) {
+    let best = -1, bd = Infinity;
     for (let i = 0; i < NM; i++) {
-      if (broken[i]) continue;
-      const k = (i + 1) % NM; let dx = mx[k] - mx[i], dz = mz[k] - mz[i]; const d = Math.hypot(dx, dz) || 1e-6;
-      const c = (d - rest[i]) / d * 0.5; dx *= c; dz *= c;
-      mx[i] += dx; mz[i] += dz; mx[k] -= dx; mz[k] -= dz;
+      if (!linkOn[i]) continue; const j = (i + 1) % NM, d = Math.hypot((mx[i] + mx[j]) / 2 - x, (my[i] + my[j]) / 2 - y);
+      if (d < bd) { bd = d; best = i; }
     }
-    // membrane bending
-    for (let i = 0; i < NM; i++) {
-      const k1 = (i + 1) % NM; if (broken[i] || broken[k1]) continue;
-      const k = (i + 2) % NM; let dx = mx[k] - mx[i], dz = mz[k] - mz[i]; const d = Math.hypot(dx, dz) || 1e-6;
-      const c = (d - bend[i]) / d * 0.5 * 0.1; dx *= c; dz *= c;
-      mx[i] += dx; mz[i] += dz; mx[k] -= dx; mz[k] -= dz;
+    if (best < 0 || bd > 1.2) return false;
+    linkOn[best] = 0; if (rand() < 0.5) linkOn[(best + 1) % NM] = 0;
+    if (S.dying < 0) { S.dying = 0; S.tearAt = best; }
+    return true;
+  }
+  S.tear = tear;
+  S.kill = () => { const i = Math.floor(rand() * NM); return tear(mx[i], my[i]); };
+  S.near = (x, y) => ringDist(mx, my, x, y) < 0.6 || polyInside(mx, my, x, y) || fluid.dye(x, y) > 0.3;
+  // the hand: whatever lies within reach of the point (wall, nucleus, vesicles) is carried with it,
+  // the nearest held hardest; the rest follows through the links and the fluid
+  S.grabAt = (gx, gy) => {
+    const ring = ringDist(mx, my, gx, gy), within = polyInside(mx, my, gx, gy);
+    let near = ring < 0.6 || within; const nodes = [], held = [], w = (d) => smooth(1 - d / REACH);
+    for (let i = 0; i < NM; i++) { const d = Math.hypot(mx[i] - gx, my[i] - gy); if (d < REACH) nodes.push([i, mx[i] - gx, my[i] - gy, w(d)]); }
+    for (const b of bodies) {
+      const d = Math.hypot(b.x - gx, b.y - gy);
+      if (d < b.r + 0.1) { held.push([b, b.x - gx, b.y - gy, 1]); near = true; }
+      else if (d < b.r + REACH * 0.5) held.push([b, b.x - gx, b.y - gy, 0.5 * w((d - b.r) / 0.5 * REACH)]);
     }
-    // filaments keep their length
-    for (let i = nc; i < np - 1; i++) {
-      if (prope[i] !== prope[i + 1]) continue;
-      let dx = px[i + 1] - px[i], dz = pz[i + 1] - pz[i]; const d = Math.hypot(dx, dz) || 1e-6;
-      const c = (d - RLINK) / d * 0.5; dx *= c; dz *= c;
-      px[i] += dx; pz[i] += dz; px[i + 1] -= dx; pz[i + 1] -= dz;
-    }
-    // nucleus presses on the wall
-    for (let i = 0; i < NM; i++) {
-      const dx = mx[i] - nuc.x, dz = mz[i] - nuc.z, d2 = dx * dx + dz * dz;
-      if (d2 >= minNM * minNM) continue;
-      const d = Math.sqrt(d2) || 1e-6, o = (minNM - d) / d;
-      mx[i] += dx * o * 0.9; mz[i] += dz * o * 0.9; nuc.x -= dx * o * 0.1; nuc.z -= dz * o * 0.1;
-    }
-    // cytoplasm keeps its volume
-    for (let i = 0; i < np; i++) {
-      const xi = px[i], zi = pz[i], ri = prad[i], rope = prope[i] >= 0;
-      for (let k = i + 1; k < np; k++) {
-        const md = ri + prad[k], dx = px[k] - xi; if (dx > md || dx < -md) continue;
-        const dz = pz[k] - zi; if (dz > md || dz < -md) continue;
-        if (rope && prope[k] >= 0) continue;
-        const d2 = dx * dx + dz * dz; if (d2 >= md * md) continue;
-        const d = Math.sqrt(d2) || 1e-6, o = (md - d) / d * 0.42;
-        px[i] -= dx * o; pz[i] -= dz * o; px[k] += dx * o; pz[k] += dz * o;
+    if (!near && nodes.length < 6 && fluid.dye(gx, gy) < 0.3) return false;
+    grab = { x: gx, y: gy, lx: gx, ly: gy, nodes, held, inner: within && ring > 0.6, has: new Set(nodes.map((n) => n[0])) };
+    S.grabbed = true; return true;
+  };
+  S.moveGrab = (x, y) => { if (grab) { const lim = FW - 1.2; grab.x = Math.max(-lim, Math.min(lim, x)); grab.y = Math.max(-lim, Math.min(lim, y)); } };
+  S.release = () => { grab = null; S.grabbed = false; };
+  function applyGrab() {
+    if (!grab) return;
+    const gx = grab.x, gy = grab.y, k = 0.35;
+    // held from inside and brought against the wall, the content catches the wall and pushes it out
+    if (grab.inner && S.dying < 0 && !(polyInside(mx, my, gx, gy) && ringDist(mx, my, gx, gy) > 0.45)) {
+      for (let i = 0; i < NM; i++) {
+        if (grab.has.has(i)) continue; const d = Math.hypot(mx[i] - gx, my[i] - gy); if (d > REACH * 0.7) continue;
+        grab.nodes.push([i, mx[i] - gx, my[i] - gy, smooth(1 - d / (REACH * 0.7)) * 0.8]); grab.has.add(i);
       }
     }
-    // cytoplasm flows around the nucleus
-    for (let i = 0; i < np; i++) {
-      const md = NR + prad[i], dx = px[i] - nuc.x, dz = pz[i] - nuc.z, d2 = dx * dx + dz * dz;
-      if (d2 >= md * md) continue;
-      const d = Math.sqrt(d2) || 1e-6, o = (md - d) / d;
-      px[i] += dx * o * 0.985; pz[i] += dz * o * 0.985; nuc.x -= dx * o * 0.015; nuc.z -= dz * o * 0.015;
+    for (const [i, ox, oy, w] of grab.nodes) { mx[i] += (gx + ox - mx[i]) * w * k; my[i] += (gy + oy - my[i]) * w * k; }
+    for (const [b, ox, oy, w] of grab.held) { b.x += (gx + ox - b.x) * w * k; b.y += (gy + oy - b.y) * w * k; }
+  }
+  // something spilt stays in the cytoplasm: off its thin edge, it is drawn back up the dye's slope
+  function keepInSpill(pt, reach, verlet) {
+    const e = HC * 1.5, gx = fluid.dye(pt.x + e, pt.y) - fluid.dye(pt.x - e, pt.y), gy = fluid.dye(pt.x, pt.y + e) - fluid.dye(pt.x, pt.y - e), gl = Math.hypot(gx, gy);
+    if (gl < 1e-3) return;
+    const nx = gx / gl, ny = gy / gl, lack = 0.75 - fluid.dye(pt.x - nx * reach, pt.y - ny * reach); if (lack <= 0) return;
+    const s = Math.min(lack, 0.6) * HC * 0.5; pt.x += nx * s; pt.y += ny * s;
+    if (verlet) { pt.px += nx * s; pt.py += ny * s; const vo = (pt.x - pt.px) * nx + (pt.y - pt.py) * ny; if (vo < 0) { pt.px += nx * vo; pt.py += ny * vo; } }
+  }
+  const gap = (i, j) => { const d = Math.abs(i - j); return Math.min(d, NM - d); };
+  const pull = (i, j, rest, k) => { const dx = mx[j] - mx[i], dy = my[j] - my[i], d = Math.hypot(dx, dy); if (d < 1e-6) return; const q = (d - rest) / d * 0.5 * k; mx[i] += dx * q; my[i] += dy * q; mx[j] -= dx * q; my[j] -= dy * q; };
+
+  // inside pressing harder than outside pushes the wall out there, and the reverse (alive only)
+  function pressurePush() {
+    const off = RW + HC * 2; let mean = 0;
+    for (let i = 0; i < NM; i++) {
+      const a = (i + NM - 1) % NM, b = (i + 1) % NM; let nx = my[b] - my[a], ny = -(mx[b] - mx[a]); const l = Math.hypot(nx, ny) || 1; nx /= l; ny /= l;
+      raw[i] = fluid.pressure(mx[i] - nx * off, my[i] - ny * off) - fluid.pressure(mx[i] + nx * off, my[i] + ny * off); mean += raw[i] / NM;
     }
-    // the wall holds the cytoplasm in (and loose strips of wall still shove it about)
-    linkNormals();
-    for (let i = 0; i < NM && holds > 0.02; i++) {
-      if (broken[i]) continue;
-      const k = (i + 1) % NM, ax = mx[i], az = mz[i], ex = mx[k] - ax, ez = mz[k] - az, il2 = 1 / (ex * ex + ez * ez + 1e-9);
-      const nx = lnx[i], nz = lnz[i];
-      for (let q = 0; q < np; q++) {
-        const rx = px[q] - ax; if (rx > 0.75 || rx < -0.75) continue;
-        const rz = pz[q] - az; if (rz > 0.75 || rz < -0.75) continue;
-        let t = (rx * ex + rz * ez) * il2; if (t < -0.06 || t > 1.06) continue;
-        t = t < 0 ? 0 : t > 1 ? 1 : t;
-        const sd = (rx - ex * t) * nx + (rz - ez * t) * nz, md = MW * 0.5 + prad[q];
-        if (sd <= -md || sd >= md) continue;
-        const dl = (sd < md * 0.3 ? -md - sd : md - sd) * holds;
-        px[q] += nx * dl * 0.72; pz[q] += nz * dl * 0.72;
-        const w = dl * 0.28;
-        mx[i] -= nx * w * (1 - t); mz[i] -= nz * w * (1 - t); mx[k] -= nx * w * t; mz[k] -= nz * w * t;
+    for (let i = 0; i < NM; i++) push[i] += ((S.dying < 0 ? Math.max(-0.01, Math.min(0.01, (raw[i] - mean) * 0.003)) : 0) - push[i]) * 0.1;
+  }
+
+  function substep(h) {
+    const alive = S.dying < 0, d = alive ? 0 : S.dying, t = S.time, cur = [0, 0];
+    const breath = 1 + 0.025 * Math.sin(t * 1.3) + 0.012 * Math.sin(t * 0.47 + 1);
+    const press = alive ? (area0 * 0.93 * breath - polyArea(mx, my)) * 0.0008 : 0;
+    const slack = alive ? 1 : Math.max(0.5, 0.92 - d * 0.03);        // the dead wall recoils, shrinks, crumples
+    msx.set(mx); msy.set(my); for (const b of bodies) { b.sx = b.x; b.sy = b.y; }
+    for (let i = 0; i < NM; i++) {
+      const a = (i + NM - 1) % NM, b = (i + 1) % NM, nx = my[b] - my[a], ny = -(mx[b] - mx[a]), nl = Math.hypot(nx, ny) || 1;
+      let vx = (mx[i] - mpx[i]) * (alive ? 0.97 : 0.95), vy = (my[i] - mpy[i]) * (alive ? 0.97 : 0.95);
+      mediumFlow(mx[i], my[i], t, cur);
+      if (!alive) {
+        // torn, blocks float: carried by the fluid round them and wandering off, the looser the more
+        const free = (linkOn[a] ? 0 : 0.5) + (linkOn[i] ? 0 : 0.5), r = roam[i], hd = r.ph + t * r.w + Math.sin(t * r.w2 + r.ph) * 1.2;
+        let ox = mx[i] - frame.x, oy = my[i] - frame.y; const ol = Math.hypot(ox, oy) || 1;
+        const sp = 0.25 * r.v * (0.3 + 0.7 * free) * smooth(d / 3), out = 0.6 * (1 - 0.7 * smooth((d - 5) / 25)), rf = RW + HC * 2.5;
+        let fx = 0, fy = 0;
+        for (let q = 0; q < 4; q++) { const qa = q * 1.5708 + 0.4, qx = mx[i] + Math.cos(qa) * rf, qy = my[i] + Math.sin(qa) * rf; fx += fluid.velU(qx, qy) / 4; fy += fluid.velV(qx, qy) / 4; }
+        cur[0] = fx + (Math.cos(hd) + ox / ol * out) * sp; cur[1] = fy + (Math.sin(hd) + oy / ol * out) * sp;
+      }
+      vx += (cur[0] * h - vx) * 0.03; vy += (cur[1] * h - vy) * 0.03;
+      mpx[i] = mx[i]; mpy[i] = my[i];
+      let lobe = 0;                                                    // the living rim pushes lobes out and draws them in
+      if (alive) { const uu = i / NM * Math.PI * 2; for (const l of lobes) lobe += l.a * Math.sin(l.k * uu + l.ph + t * l.w) * (0.6 + 0.4 * Math.sin(t * 0.13 * l.k + l.ph * 3)); lobe *= 0.0016; }
+      mx[i] += vx + nx * (press + lobe) + nx / nl * push[i]; my[i] += vy + ny * (press + lobe) + ny / nl * push[i];
+    }
+    if (alive && !grab) { let cx = 0, cy = 0; for (let i = 0; i < NM; i++) { cx += mx[i]; cy += my[i]; } cx /= NM; cy /= NM; for (let i = 0; i < NM; i++) { mx[i] -= cx * 0.002; my[i] -= cy * 0.002; } }
+    applyGrab();
+    for (let it = 0; it < 4; it++) {
+      for (let i = 0; i < NM; i++) if (linkOn[i]) pull(i, (i + 1) % NM, linkRest[i] * Math.max(0.88, slack), 0.9);
+      for (let i = 0; i < NM; i++) { const j = (i + 1) % NM; if (linkOn[i] && linkOn[j]) pull(i, (i + 2) % NM, bendRest[i] * slack, alive ? 0.035 : 0.06); }
+    }
+    // blocks don't pass through stretches of wall they aren't part of, nor into each other
+    const minS = MW * 0.95, minD = L * 0.8;
+    for (let it = 0; it < 2; it++) for (let q = 0; q < NM; q++) for (let i = 0; i < NM; i++) {
+      if (!linkOn[i]) continue; const j = (i + 1) % NM; if (gap(q, i) <= 3 || gap(q, j) <= 3) continue;
+      const sx = mx[j] - mx[i], sy = my[j] - my[i], l2 = sx * sx + sy * sy, axx = mx[q] - mx[i], ayy = my[q] - my[i];
+      if (l2 < 1e-12 || axx * axx + ayy * ayy > 2 * (minS * minS + l2)) continue;
+      const tt = Math.max(0, Math.min(1, (axx * sx + ayy * sy) / l2)); let dx = axx - sx * tt, dy = ayy - sy * tt; const dd = Math.hypot(dx, dy);
+      if (dd >= minS) continue; if (dd < 1e-6) { const l = Math.sqrt(l2); dx = -sy / l; dy = sx / l; } else { dx /= dd; dy /= dd; }
+      const pen = (minS - dd) * 0.5; mx[q] += dx * pen; my[q] += dy * pen; mx[i] -= dx * pen * (1 - tt); my[i] -= dy * pen * (1 - tt); mx[j] -= dx * pen * tt; my[j] -= dy * pen * tt;
+    }
+    for (let i = 0; i < NM; i++) for (let j = i + 1; j < NM; j++) {
+      if (gap(i, j) <= 1 && linkOn[j === (i + 1) % NM ? i : j]) continue;
+      const dx = mx[j] - mx[i], dy = my[j] - my[i], d2 = dx * dx + dy * dy; if (d2 >= minD * minD || d2 < 1e-12) continue;
+      const dd = Math.sqrt(d2), q = (minD - dd) / dd * 0.5; mx[i] -= dx * q; my[i] -= dy * q; mx[j] += dx * q; my[j] += dy * q;
+    }
+    if (alive && grab) {                                               // pulled too far, the wall gives way
+      for (let i = 0; i < NM; i++) { const j = (i + 1) % NM; if (Math.hypot(mx[j] - mx[i], my[j] - my[i]) > linkRest[i] * TEAR_AT) { tear((mx[i] + mx[j]) / 2, (my[i] + my[j]) / 2); break; } }
+    }
+    if (!alive) for (let i = 0; i < NM; i++) {                         // the tear spreads, then the ring falls apart from the tear on round
+      if (!linkOn[i]) continue; const j = (i + 1) % NM, len = Math.hypot(mx[j] - mx[i], my[j] - my[i]);
+      if (len > linkRest[i] * Math.max(0.88, slack) * 1.35 && rand() < 0.08) linkOn[i] = 0;
+      else if (d > 2 && gap(i, S.tearAt) < 3 + d * 1.6 && rand() < 0.00012 * Math.min(d, 10)) linkOn[i] = 0;
+    }
+    // content: carried by the fluid; the dying nucleus shrinks to a clot
+    nuc.r = nuc.r0 * (1 - 0.15 * smooth(d / 3));
+    for (const b of bodies) {
+      let vx = (b.x - b.px) * 0.96, vy = (b.y - b.py) * 0.96; b.px = b.x; b.py = b.y; let fu = 0, fv = 0;
+      if (b.solid) { const rr = b.r + HC * 3; for (let q = 0; q < 8; q++) { const a = q / 8 * 6.2832, x = b.x + Math.cos(a) * rr, y = b.y + Math.sin(a) * rr; fu += fluid.velU(x, y) / 8; fv += fluid.velV(x, y) / 8; } }
+      else { fu = fluid.velU(b.x, b.y); fv = fluid.velV(b.x, b.y); }
+      const k = b.solid ? 0.2 : 0.35; vx += (fu * h - vx) * k; vy += (fv * h - vy) * k; b.x += vx; b.y += vy;
+      if (!alive) keepInSpill(b, b.r + 0.04, true);
+    }
+    for (let a = 0; a < bodies.length; a++) {
+      const A = bodies[a];
+      for (let q = a + 1; q < bodies.length; q++) {
+        const B = bodies[q], dx = B.x - A.x, dy = B.y - A.y, dd = Math.hypot(dx, dy), rr = A.r + B.r;
+        if (dd < rr && dd > 1e-6) { const pen = rr - dd, wa = B.m / (A.m + B.m); A.x -= dx / dd * pen * wa; A.y -= dy / dd * pen * wa; B.x += dx / dd * pen * (1 - wa); B.y += dy / dd * pen * (1 - wa); }
+      }
+      const rr = A.r + RW, w = 4 / (A.m + 4);
+      for (let n = 0; n < NM; n++) {
+        const n1 = (n + 1) % NM; let tt = 0;
+        if (linkOn[n]) { const sx = mx[n1] - mx[n], sy = my[n1] - my[n], l2 = sx * sx + sy * sy; if (l2 > 1e-12) tt = Math.max(0, Math.min(1, ((A.x - mx[n]) * sx + (A.y - my[n]) * sy) / l2)); }
+        const qx = mx[n] + (mx[n1] - mx[n]) * tt, qy = my[n] + (my[n1] - my[n]) * tt, dx = A.x - qx, dy = A.y - qy, dd = Math.hypot(dx, dy);
+        if (dd < rr && dd > 1e-6) { const pen = rr - dd, ex = dx / dd, ey = dy / dd, m = pen * (1 - w); A.x += ex * pen * w; A.y += ey * pen * w; mx[n] -= ex * m * (1 - tt); my[n] -= ey * m * (1 - tt); mx[n1] -= ex * m * tt; my[n1] -= ey * m * tt; }
+      }
+      A.angle += ((A.x - A.px) * 0.7 - (A.y - A.py) * 0.4) / A.r;
+    }
+    // the ring never crosses itself: a move that would is taken back
+    let crossed = false;
+    for (let i = 0; i < NM && !crossed; i++) { if (!linkOn[i]) continue; const i1 = (i + 1) % NM;
+      for (let j = i + 2; j < NM; j++) { if (!linkOn[j]) continue; const j1 = (j + 1) % NM; if (j1 === i) continue; if (segsCross(mx[i], my[i], mx[i1], my[i1], mx[j], my[j], mx[j1], my[j1])) { crossed = true; break; } } }
+    if (crossed) { mx.set(msx); my.set(msy); }
+    if (alive) for (const b of bodies) if (!polyInside(mx, my, b.x, b.y)) { b.x = b.px = b.sx; b.y = b.py = b.sy; }
+  }
+
+  function fluidStep(dt) {
+    const alive = S.dying < 0, d = alive ? 0 : S.dying, t = S.time;
+    if (t - fieldsAt > 0.2) updateFields(t);
+    fluid.rasterize(mx, my, mvx, mvy, linkOn, nuc);
+    const thick = Math.min(1, d / 18), stir = alive ? 1 : Math.max(0, 1 - d / 4);
+    let pour = 0, mX = 0, mY = 0, oX = 0, oY = 0;
+    if (!alive) {
+      const a = S.tearAt, b = (a + 1) % NM; mX = (mx[a] + mx[b]) / 2; mY = (my[a] + my[b]) / 2; oX = mX - frame.x; oY = mY - frame.y;
+      const ol = Math.hypot(oX, oY) || 1; oX /= ol; oY /= ol; pour = 0.32 * smooth(d / 1.5) * (1 - smooth(d / 24));
+    }
+    // forces on each face: streaming inside (carried with the cell), the medium's current outside,
+    // and once torn a draw towards the mouth of the tear and on out of it
+    for (let pass = 0; pass < 2; pass++) {
+      const fvel = pass ? frame.vy : frame.vx, W = pass ? G : G1, Hh = pass ? G1 : G, F = pass ? v : u, sxx = pass ? strY : strX, cxx = pass ? curY : curX, st = pass ? G : 1;
+      for (let j = pass; j < Hh - pass; j++) for (let i = 1 - pass; i < W - 1 + pass; i++) {
+        const f = j * W + i, a = pass ? (j - 1) * G + i : j * G + i - 1, b = a + st, ins = inCell[a] | inCell[b], dy_ = (c[a] + c[b]) * 0.5;
+        if (ins) { if (stir > 0) F[f] += ((sxx[a] + sxx[b]) * 0.5 + (alive ? fvel : 0) - F[f]) * 0.04 * stir; if (!alive) F[f] *= 1 - 0.06 * thick; }
+        else F[f] += ((cxx[a] + cxx[b]) * 0.5 - F[f]) * Math.min(1, 0.12 + (alive ? 0 : dy_ * (0.05 + 0.25 * thick)));
+        if (pour > 0 && dy_ > 0.05) {
+          const fx = pass ? cellX(i) : cellX(i) - HC / 2, fy = pass ? cellX(j) - HC / 2 : cellX(j), rx_ = fx - mX, ry_ = fy - mY, rl = Math.hypot(rx_, ry_) || 1;
+          let dir;
+          if (ins) dir = -(pass ? ry_ : rx_) / rl * Math.min(1, rl / 0.8);
+          else { const fan = Math.max(0, (rx_ * oX + ry_ * oY) / rl); dir = ((pass ? oY : oX) * 0.7 + (pass ? ry_ : rx_) / rl * 0.3) * fan * Math.exp(-rl / 3.5); }
+          F[f] += (dir * pour - F[f]) * 0.04 * Math.min(1, dy_ * 1.5);
+        }
       }
     }
-  }
-  // the medium is thick: only part of each correction survives
-  for (let i = 0; i < NM; i++) { mx[i] = msx[i] + (mx[i] - msx[i]) * P.mVisc; mz[i] = msz[i] + (mz[i] - msz[i]) * P.mVisc; }
-  for (let i = 0; i < np; i++) { px[i] = psx[i] + (px[i] - psx[i]) * P.pVisc; pz[i] = psz[i] + (pz[i] - psz[i]) * P.pVisc; }
-  // the nucleus can never pass through a bead of intact wall; what the wall will not give, the whole cell does,
-  // sliding across the slide after the nucleus
-  let bx = 0, bz = 0;
-  for (let i = 0; i < NM; i++) {
-    const dx = mx[i] - nuc.x, dz = mz[i] - nuc.z, d2 = dx * dx + dz * dz;
-    if (d2 >= minNM * minNM) continue;
-    const d = Math.sqrt(d2) || 1e-6, o = (minNM - d) / d;
-    nuc.x -= dx * o; nuc.z -= dz * o; bx += dx * o; bz += dz * o;
-  }
-  const tow = P.tow * holds;
-  if (tow > 0 && (bx || bz)) {
-    bx *= tow; bz *= tow; nuc.x += bx; nuc.z += bz;
-    for (let i = 0; i < NM; i++) { mx[i] += bx; mz[i] += bz; }
-    for (let i = 0; i < np; i++) { px[i] += bx; pz[i] += bz; }
-  }
-  // a stretched wall creeps: it grows longer and thinner where it is pulled, and tears once it is thin enough
-  if (!ruptured) for (let i = 0; i < NM; i++) {
-    const k = (i + 1) % NM, st = Math.hypot(mx[k] - mx[i], mz[k] - mz[i]) / rest[i];
-    if (st > P.creepFrom) {
-      elong[i] += (st - P.creepFrom) * P.creep; rest[i] = rest0[i] * TENSION * elong[i];
-      if (elong[i] > P.tearAt) breakLink(i);
+    if (grab) {                                                        // the hand sweeps the fluid under it along
+      const gvx = (grab.x - grab.lx) / dt, gvy = (grab.y - grab.ly) / dt, RR = REACH * 0.8; grab.lx = grab.x; grab.ly = grab.y;
+      const i0 = Math.max(1, Math.floor(cellAt(grab.x - RR))), i1 = Math.min(G - 1, Math.ceil(cellAt(grab.x + RR))), j0 = Math.max(1, Math.floor(cellAt(grab.y - RR))), j1 = Math.min(G - 1, Math.ceil(cellAt(grab.y + RR)));
+      for (let j = j0; j <= j1; j++) for (let i = i0; i <= i1; i++) {
+        const k = j * G + i; if (alive && !inCell[k]) continue; const dd = Math.hypot(cellX(i) - grab.x, cellX(j) - grab.y); if (dd > RR) continue;
+        const w = 0.5 * smooth(1 - dd / RR); u[j * G1 + i] += (gvx - u[j * G1 + i]) * w; v[k] += (gvy - v[k]) * w;
+      }
     }
-    damage[i] = (elong[i] - 1.12) / (P.tearAt - 1.12);
+    src.fill(0);                                                       // torn, the cytoplasm swells: that is what drives it out
+    if (!alive) { const sIn = 0.06 * (1 - smooth(d / 25)), sOut = 0.04 * (1 - smooth(d / 30)); for (let k = 0; k < GN; k++) { if (solid[k] || c[k] < 0.05) continue; src[k] = inCell[k] ? sIn * Math.min(1, c[k] * 2) : sOut * c[k]; } }
+    fluid.enforceWalls(); fluid.advectVelocity(dt); fluid.viscosity(0.5 * (1 + thick)); fluid.enforceWalls(); fluid.project(22);
+    fluid.advectScalars(dt, alive ? 0 : 0.035);
+    if (alive) for (let k = 0; k < GN; k++) { if (solid[k]) continue; if (inCell[k]) c[k] += (1 - c[k]) * 0.05; else c[k] *= 0.9; }
+    else fluid.creep(0.06 * (1 - 0.8 * thick));
+    fluid.fillWalls(!alive); fluid.resetCoords(t);
   }
-}
 
-function stepFrame() {
-  for (let i = 0; i < np; i++) { pfx[i] = px[i]; pfz[i] = pz[i]; }
-  nuc.fx = nuc.x; nuc.fz = nuc.z;
-  for (let s = 0; s < P.sub; s++) substep();
-  // the shape remembers how it was pushed
-  for (let i = 0; i < NM; i++) {
-    const k = (i + 2) % NM; bend[i] += (Math.hypot(mx[k] - mx[i], mz[k] - mz[i]) - bend[i]) * 0.02;
-  }
-  // a little thermal jiggle
-  const jig = 0.0016 * (1 - 0.85 * death);
-  for (let i = 0; i < np; i++) { px[i] += (Math.random() - 0.5) * jig; pz[i] += (Math.random() - 0.5) * jig; }
-  if (ruptured) {
-    const age = time - ruptureT;
-    death = Math.min(1, Math.max(0, age - 3) / 8); death = death * death * (3 - 2 * death);
-    // first the torn wall recoils and squeezes the contents out through the gap; then it goes slack
-    const squeeze = Math.min(1, age / 3.5) * (1 - Math.min(1, Math.max(0, age - 5) / 4));
-    let cx = 0, cz = 0;
-    for (let i = 0; i < NM; i++) { rest[i] = rest0[i] * TENSION * elong[i] * (1 - 0.24 * squeeze); cx += mx[i]; cz += mz[i]; damage[i] *= 0.97; }
-    cx /= NM; cz /= NM;
-    // the gap widens a little, then the bead chain parts where it was always going to
-    if (age < 3 && Math.random() < 0.03) { const side = Math.random() < 0.5 ? 1 : NM - 1; let k = tearIdx; while (broken[k]) k = (k + side) % NM; if (Math.abs(((k - tearIdx + NM + NM / 2) % NM) - NM / 2) < 4) broken[k] = 1; }
-    for (let i = 0; i < NM; i++) if (age > breakAt[i]) broken[i] = 1;
-    // with nothing holding it in, the contents slump and spread, carrying the wreckage outward
-    const swell = 1 + 0.32 * Math.min(1, Math.max(0, age - 2) / 9), drift = 0.0009 * death * Math.max(0, 1 - age / 20);
-    for (let i = 0; i < nc; i++) prad[i] = PR * swell;
-    for (let i = 0; i < NM; i++) { mx[i] += (mx[i] - cx) * drift; mz[i] += (mz[i] - cz) * drift; }
-    for (let i = 0; i < NM; i++) if (sAtt[i] && age > sPeelAt[i]) {
-      sAtt[i] = 0; const kick = 0.006 + Math.random() * 0.006;
-      svx[i] = snx[i] * kick + (Math.random() - 0.5) * 0.004; svz[i] = snz[i] * kick + (Math.random() - 0.5) * 0.004;
+  function passengers(dt) {
+    const alive = S.dying < 0, pt = { x: 0, y: 0 };
+    const carry = (x, y) => { pt.x = x + fluid.velU(x, y) * dt; pt.y = y + fluid.velV(x, y) * dt;
+      if (alive) { if (!polyInside(mx, my, pt.x, pt.y) || ringDist(mx, my, pt.x, pt.y) < 0.24) { pt.x += (frame.x - pt.x) * 0.03; pt.y += (frame.y - pt.y) * 0.03; } }
+      else keepInSpill(pt, 0.12, false); };
+    for (const b of bits) { carry(b.x, b.y); b.x = pt.x; b.y = pt.y; const dx = b.x - nuc.x, dy = b.y - nuc.y, dd = Math.hypot(dx, dy); if (dd < nuc.r + 0.06 && dd > 1e-6) { b.x += dx / dd * (nuc.r + 0.06 - dd); b.y += dy / dd * (nuc.r + 0.06 - dd); } }
+    for (let i = 0; i < rx.length; i++) { carry(rx[i], ry[i]); rx[i] = pt.x; ry[i] = pt.y; }
+    for (let it = 0; it < 3; it++) for (let r = 0; r < ROPES; r++) for (let i = r * RLEN; i < (r + 1) * RLEN - 1; i++) {
+      const dx = rx[i + 1] - rx[i], dy = ry[i + 1] - ry[i], dd = Math.hypot(dx, dy) || 1e-6, q = (dd - RLINK) / dd * 0.5; rx[i] += dx * q; ry[i] += dy * q; rx[i + 1] -= dx * q; ry[i + 1] -= dy * q;
     }
   }
-  stepSkirt();
+
+  S.step = (dt) => {
+    m0x.set(mx); m0y.set(my); for (const b of bodies) { b.x0 = b.x; b.y0 = b.y; }
+    pressurePush();
+    for (let s = 0; s < 3; s++) substep(dt / 3);
+    const snap = S.dying < 0 ? 12 : 1.5; let cx = 0, cy = 0, cvx = 0, cvy = 0;
+    for (let i = 0; i < NM; i++) {
+      mvx[i] = (mx[i] - m0x[i]) / dt; mvy[i] = (my[i] - m0y[i]) / dt; cx += mx[i] / NM; cy += my[i] / NM; cvx += mvx[i] / NM; cvy += mvy[i] / NM;
+      const sp = Math.hypot(mvx[i], mvy[i]); if (sp > snap) { mvx[i] *= snap / sp; mvy[i] *= snap / sp; }
+    }
+    frame.x = cx; frame.y = cy; frame.vx = cvx; frame.vy = cvy;
+    for (const b of bodies) { b.vx = (b.x - b.x0) / dt; b.vy = (b.y - b.y0) / dt; }
+    fluidStep(dt); passengers(dt);
+    S.time += dt; if (S.dying >= 0) S.dying += dt;
+  };
+  S.leaked = () => { let out = 0, all = 0; for (let k = 0; k < GN; k++) { if (solid[k]) continue; all += c[k]; if (!inCell[k]) out += c[k]; } return all ? out / all : 0; };
+  return S;
 }
 
-function skirtLink(i) { const k = (i + 1) % NM; return !sBrk[i] && !(sAtt[i] && sAtt[k] && broken[i]); }
-function stepSkirt() {
-  // bead normals: average of the intact links either side
-  linkNormals();
-  for (let i = 0; i < NM; i++) {
-    const p = (i + NM - 1) % NM; let nx = 0, nz = 0;
-    if (!broken[i]) { nx += lnx[i]; nz += lnz[i]; } if (!broken[p]) { nx += lnx[p]; nz += lnz[p]; }
-    const l = Math.hypot(nx, nz); if (l > 1e-5) { pnx[i] = nx / l; pnz[i] = nz / l; }
-  }
-  const ww = MW * 0.45;
-  for (let i = 0; i < NM; i++) {
-    if (sAtt[i]) { sx[i] = mx[i] + pnx[i] * ww; sz[i] = mz[i] + pnz[i] * ww; snx[i] = pnx[i]; snz[i] = pnz[i]; continue; }
-    sFlat[i] = Math.min(1, sFlat[i] + 1 / 80);
-    svx[i] *= 0.985; svz[i] *= 0.985; sx[i] += svx[i]; sz[i] += svz[i];
-    const dx = sx[i] - nuc.x, dz = sz[i] - nuc.z, d = Math.hypot(dx, dz), md = NR + 0.12;     // the nucleus still shoves loose ribbon about
-    if (d < md) { sx[i] += dx / d * (md - d); sz[i] += dz / d * (md - d); }
-  }
-  for (let it = 0; it < 3; it++) for (let i = 0; i < NM; i++) {
-    const k = (i + 1) % NM; if (!skirtLink(i) || (sAtt[i] && sAtt[k])) continue;
-    let dx = sx[k] - sx[i], dz = sz[k] - sz[i]; const d = Math.hypot(dx, dz) || 1e-6, c = (d - rest0[i] * 1.05) / d;
-    const wi = sAtt[i] ? 0 : sAtt[k] ? 1 : 0.5, wk = sAtt[k] ? 0 : sAtt[i] ? 1 : 0.5;
-    sx[i] += dx * c * wi; sz[i] += dz * c * wi; sx[k] -= dx * c * wk; sz[k] -= dz * c * wk;
-  }
-  // a loose ribbon lies flat; its width runs across its own length
-  for (let i = 0; i < NM; i++) {
-    if (sAtt[i]) continue;
-    const p = (i + NM - 1) % NM, k = (i + 1) % NM, a = skirtLink(p) ? p : i, b = skirtLink(i) ? k : i;
-    if (a === b) continue;
-    const tx = sx[b] - sx[a], tz = sz[b] - sz[a], l = Math.hypot(tx, tz) || 1e-6;
-    snx[i] += (tz / l - snx[i]) * 0.3; snz[i] += (-tx / l - snz[i]) * 0.3;
-  }
-}
+const H = 0.3, HAIRS = 4, HSEG = 6, TEAR = 1.2;
 
 // ───────────────────────── renderer ─────────────────────────
 const stage = document.getElementById('stage');
@@ -412,56 +614,17 @@ const NOISE = /* glsl */`
   float fbm(vec2 p){ float a = .5, s = 0.; for (int i = 0; i < 5; i++){ s += a * vnoise(p); p = p * 2.03 + vec2(13.7, 7.1); a *= .5; } return s; }
 `;
 const flat = (o) => Object.assign(o, { transparent: true, depthTest: false, depthWrite: false, side: THREE.DoubleSide });
-const fieldUniforms = { tField: { value: null }, tDisp: { value: null }, uHalf: { value: new THREE.Vector2(HX, HZ) } };
 const uTime = { value: 0 }, uFade = { value: 0 };
 
-// ── fluid field: particles splatted as density + velocity ──
-const rtOpts = { type: THREE.HalfFloatType, format: THREE.RGBAFormat, minFilter: THREE.LinearFilter, magFilter: THREE.LinearFilter, depthBuffer: false, stencilBuffer: false };
-const fieldRT = new THREE.WebGLRenderTarget(FW, FH, rtOpts);
-let dispA = new THREE.WebGLRenderTarget(FW, FH, rtOpts), dispB = new THREE.WebGLRenderTarget(FW, FH, rtOpts);
-const fieldScene = new THREE.Scene();
-const fieldGeo = new THREE.BufferGeometry();
-const NSPLAT = 19, nucOff = [[0, 0]];
-for (let i = 0; i < 6; i++) nucOff.push([Math.cos(i * 1.0472) * 0.45, Math.sin(i * 1.0472) * 0.45]);
-for (let i = 0; i < 12; i++) nucOff.push([Math.cos(i * 0.5236) * 0.88, Math.sin(i * 0.5236) * 0.88]);
-const TRAIL = 40, TSPL = 7, FMAX = MAXP + NSPLAT + TRAIL * TSPL;   // a fading wake keeps the stain closed behind a fast nucleus
-const trail = new Float32Array(TRAIL * 2); let trailHead = 0;
-const fPos = new Float32Array(FMAX * 3), fVel = new Float32Array(FMAX * 2), fW = new Float32Array(FMAX).fill(1);
-fieldGeo.setAttribute('position', new THREE.BufferAttribute(fPos, 3).setUsage(THREE.DynamicDrawUsage));
-fieldGeo.setAttribute('aVel', new THREE.BufferAttribute(fVel, 2).setUsage(THREE.DynamicDrawUsage));
-fieldGeo.setAttribute('aW', new THREE.BufferAttribute(fW, 1).setUsage(THREE.DynamicDrawUsage));
-const fieldPts = new THREE.Points(fieldGeo, new THREE.ShaderMaterial({
-  uniforms: { uHalf: fieldUniforms.uHalf, uSize: { value: 0.76 / (2 * HZ) * FH } },
-  vertexShader: `attribute vec2 aVel; attribute float aW; varying vec2 vVel; varying float vW; uniform vec2 uHalf; uniform float uSize;
-    void main(){ vVel = aVel; vW = aW; gl_Position = vec4(position.x / uHalf.x, position.z / uHalf.y, 0., 1.); gl_PointSize = uSize; }`,
-  fragmentShader: `varying vec2 vVel; varying float vW;
-    void main(){ vec2 q = gl_PointCoord * 2. - 1.; float d = dot(q, q); if (d > 1.) discard; float f = (1. - d); f *= f * vW;
-      gl_FragColor = vec4(vVel * f, f, f); }`,
-  blending: THREE.CustomBlending, blendEquation: THREE.AddEquation, blendSrc: THREE.OneFactor, blendDst: THREE.OneFactor,
-  blendSrcAlpha: THREE.OneFactor, blendDstAlpha: THREE.OneFactor, depthTest: false, depthWrite: false, transparent: true,
-}));
-fieldPts.frustumCulled = false; fieldScene.add(fieldPts);
-
-// ── texture coordinates carried along by the flow, so the stain streaks where it is stirred ──
+// ── the fluid, handed to the shaders as two float textures ──
+const dataA = new Float32Array(GN * 4), dataB = new Float32Array(GN * 4);
+const mkTex = (d) => { const t = new THREE.DataTexture(d, G, G, THREE.RGBAFormat, THREE.FloatType); t.minFilter = t.magFilter = THREE.LinearFilter; t.wrapS = t.wrapT = THREE.ClampToEdgeWrapping; t.needsUpdate = true; return t; };
+const texA = mkTex(dataA), texB = mkTex(dataB), uWA = { value: 1 };
+renderer.extensions.get('OES_texture_float_linear');
+const fluidUniforms = { tA: { value: texA }, tB: { value: texB }, uWA };
 const quadCam = new THREE.OrthographicCamera(-1, 1, 1, -1, 0, 1);
 const quadGeo = new THREE.PlaneGeometry(2, 2);
 const QUAD_VS = `varying vec2 vUv; void main(){ vUv = uv; gl_Position = vec4(position.xy, 0., 1.); }`;
-const advectMat = new THREE.ShaderMaterial({
-  uniforms: { tField: { value: fieldRT.texture }, tPrev: { value: null }, uHalf: fieldUniforms.uHalf, uReset: { value: 1 } },
-  vertexShader: QUAD_VS,
-  fragmentShader: `varying vec2 vUv; uniform sampler2D tField, tPrev; uniform vec2 uHalf; uniform float uReset;
-    void main(){
-      vec4 f = texture2D(tField, vUv);
-      float m = smoothstep(.08, .35, f.b);
-      vec2 vel = f.rg / max(f.b, .12) * m;
-      vec2 d = texture2D(tPrev, vUv - vel / (2. * uHalf)).rg - vel;
-      d *= mix(.97, .9988, m);
-      float l = length(d); if (l > 3.5) d *= 3.5 / l;
-      gl_FragColor = vec4(d * (1. - uReset), 0., 1.);
-    }`,
-  depthTest: false, depthWrite: false,
-});
-const quadScene = new THREE.Scene(); const quadMesh = new THREE.Mesh(quadGeo, advectMat); quadMesh.frustumCulled = false; quadScene.add(quadMesh);
 
 // ── the slide ──
 const slide = new THREE.Mesh(new THREE.PlaneGeometry(60, 60).rotateX(-Math.PI / 2), new THREE.ShaderMaterial(flat({
@@ -541,7 +704,6 @@ for (let i = 0; i < LIT; i++) {
   litter.seed[i] = Math.random();
 }
 const organ = spriteCloud(160, 6);
-const organIdx = new Int32Array(160); let organN = 0;
 
 // ── line helpers ──
 function lineMat(color, opacity) {
@@ -566,15 +728,15 @@ const worms = lineObj(WORMS * WSEG * 2, true, 0x3a2a48, 0.7, 1);
 const wormS = []; for (let i = 0; i < WORMS; i++) wormS.push({ x: (Math.random() - 0.5) * 17, z: (Math.random() - 0.5) * 11, a: Math.random() * 6.28, ph: Math.random() * 9, len: 0.25 + Math.random() * 0.5, sp: 0.1 + Math.random() * 0.25 });
 
 // ── shadow on the slide ──
-const sheet = new THREE.PlaneGeometry(HX * 2, HZ * 2).rotateX(-Math.PI / 2);
+const sheet = new THREE.PlaneGeometry(FW * 2, FW * 2).rotateX(-Math.PI / 2);
 const SHEET_VS = `varying vec2 vW; void main(){ vec4 w = modelMatrix * vec4(position, 1.); vW = w.xz; gl_Position = projectionMatrix * viewMatrix * w; }`;
 const shadow = new THREE.Mesh(sheet, new THREE.ShaderMaterial(flat({
-  uniforms: fieldUniforms, vertexShader: SHEET_VS,
-  fragmentShader: `varying vec2 vW; uniform sampler2D tField; uniform vec2 uHalf;
-    void main(){ vec2 uv = vW / (2. * uHalf) + .5 + vec2(.004, .012); float s = 0.;
-      for (int i = 0; i < 8; i++){ float a = float(i) * .785; s += texture2D(tField, uv + vec2(cos(a), sin(a)) * .012).b; }
-      s = s / 8. * .6 + texture2D(tField, uv).b * .4;
-      gl_FragColor = vec4(.2, .13, .28, smoothstep(.1, .8, s) * .2); }`,
+  uniforms: fluidUniforms, vertexShader: SHEET_VS,
+  fragmentShader: `varying vec2 vW; uniform sampler2D tA;
+    void main(){ vec2 uv = vW / ${(2 * FW).toFixed(1)} + .5 + vec2(.004, .012); float s = 0.;
+      for (int i = 0; i < 8; i++){ float a = float(i) * .785; s += texture2D(tA, uv + vec2(cos(a), sin(a)) * .012).r; }
+      s = s / 8. * .6 + texture2D(tA, uv).r * .4;
+      gl_FragColor = vec4(.2, .13, .28, smoothstep(.05, .7, s) * .2); }`,
 })));
 shadow.position.y = 0.004; shadow.renderOrder = 2; scene.add(shadow);
 
@@ -629,45 +791,37 @@ for (let i = 0; i < NM * HAIRS; i++) {
   for (let k = 0; k < HSEG; k++) { const b = (i * HSEG + k) * 2; cilia.al[b] = 1 - k / HSEG * 0.75; cilia.al[b + 1] = 1 - (k + 1) / HSEG * 0.75; }
 }
 
-// ── cytoplasm ──
+// ── cytoplasm: the dye, coloured through coordinates the flow has carried, so the stain marbles as it moves ──
 const cyto = new THREE.Mesh(sheet, new THREE.ShaderMaterial(flat({
-  uniforms: { ...fieldUniforms, uTime, uFade }, vertexShader: SHEET_VS,
-  fragmentShader: NOISE + `varying vec2 vW; uniform sampler2D tField, tDisp; uniform vec2 uHalf; uniform float uTime, uFade;
+  uniforms: { ...fluidUniforms, uTime, uFade }, vertexShader: SHEET_VS,
+  fragmentShader: NOISE + `varying vec2 vW; uniform sampler2D tA, tB; uniform float uTime, uFade, uWA;
     vec3 stain(vec2 p){
       float n1 = fbm(p * 1.05), n2 = fbm(p * 2.6 + 13.1), n3 = fbm(p * 7.5 + n1 * 2.);
-      vec3 col = mix(vec3(.585, .25, .725), vec3(.725, .39, .835), smoothstep(.28, .72, n1));
-      col = mix(col, vec3(.84, .64, .915), smoothstep(.5, .78, n2) * .6);
+      vec3 col = mix(vec3(.60, .26, .73), vec3(.74, .40, .84), smoothstep(.28, .72, n1));
+      col = mix(col, vec3(.85, .65, .92), smoothstep(.5, .78, n2) * .6);
       col *= .9 + .2 * n3;
       float vein = 1. - smoothstep(0., .09, abs(fract(n1 * 4.5 + n2 * 1.5) - .5));
-      col = mix(col, vec3(.5, .22, .64), vein * .2);
-      float pale = 1. - smoothstep(0., .035, abs(fract(n2 * 5. + n1) - .5));
-      col = mix(col, vec3(.88, .72, .94), pale * .14);
+      col = mix(col, vec3(.5, .22, .64), vein * .22);
       float th = fbm(p * 5.5 + 40.);
-      col = mix(col, vec3(.45, .19, .6), (1. - smoothstep(0., .06, abs(fract(th * 7.) - .5))) * .16);   // fine threads that show the flow
+      col = mix(col, vec3(.45, .19, .6), (1. - smoothstep(0., .06, abs(fract(th * 7.) - .5))) * .17);
       col = mix(col, vec3(.9, .76, .96), smoothstep(.62, .7, fbm(p * 9. + 71.)) * .22);
       return col;
     }
     void main(){
-      vec2 uv = vW / (2. * uHalf) + .5;
-      float f = texture2D(tField, uv).b;
-      vec2 d = texture2D(tDisp, uv).rg;
-      vec2 e = vec2(1.5) / vec2(${FW}., ${FH}.);
-      vec2 g = vec2(texture2D(tField, uv + vec2(e.x, 0.)).b - texture2D(tField, uv - vec2(e.x, 0.)).b,
-                    texture2D(tField, uv + vec2(0., e.y)).b - texture2D(tField, uv - vec2(0., e.y)).b);
-      // a dead cell is only a stain: its edge frays into fibres that run outward
-      vec2 gd = normalize(g + 1e-5), q = vW + d * .5;
-      float fibre = vnoise(vec2(dot(q, vec2(-gd.y, gd.x)) * 15., dot(q, gd) * 1.6)) * .7 + vnoise(q * 30.) * .3;
-      float fr = f * mix(1., .25 + 1.5 * fibre, uFade);
-      float a = mix(smoothstep(.26, .5, f), smoothstep(.16, .62, fr), uFade);
+      vec2 uv = vW / ${(2 * FW).toFixed(1)} + .5;
+      vec4 A = texture2D(tA, uv); vec2 B = texture2D(tB, uv).rg; float f = A.r;
+      float a = mix(smoothstep(.34, .6, f), smoothstep(.16, .62, f), uFade);
       if (a < .01) discard;
-      vec3 col = stain(vW + d + .04 * vec2(sin(uTime * .3 + vW.y * 2.), cos(uTime * .27 + vW.x * 2.)));
-      float rim = (1. - smoothstep(.45, .95, f)) * (1. - uFade);
-      col = mix(col, vec3(.44, .2, .56), rim * .5);                       // the stain pools at the edge
-      col += dot(g, vec2(-.6, -.8)) * rim * .5;                          // a little relief where the slab ends
+      vec3 col = mix(stain(vW + B), stain(vW + A.gb), uWA);
+      float e = 1.5 / ${G}.;
+      vec2 g = vec2(texture2D(tA, uv + vec2(e, 0.)).r - texture2D(tA, uv - vec2(e, 0.)).r, texture2D(tA, uv + vec2(0., e)).r - texture2D(tA, uv - vec2(0., e)).r);
+      float rim = (1. - smoothstep(.45, .95, f)) * (1. - .6 * uFade);
+      col = mix(col, vec3(.44, .2, .56), rim * .5);
+      col += dot(g, vec2(-.6, -.8)) * rim * .35;
       float l = dot(col, vec3(.3, .5, .2));
       vec3 dead = vec3(l) * vec3(1.0, .8, 1.03) + vec3(.07, .03, .08);
-      dead *= .9 + .2 * vnoise(vW * 26.) * vnoise(vW * 61. + 3.);          // the stain turns grainy once the flow stops
-      col = mix(col, dead, uFade * .6);
+      dead *= .9 + .2 * vnoise(vW * 26.) * vnoise(vW * 61. + 3.);          // the stain turns grainy once it sets
+      col = mix(col, dead, uFade * .55);
       gl_FragColor = vec4(col, a * mix(.95, .86, uFade));
     }`,
 })));
@@ -698,22 +852,6 @@ const nucMesh = new THREE.Mesh(new THREE.CircleGeometry(NR * 1.06, 64).rotateX(-
 })));
 nucMesh.renderOrder = 9; scene.add(nucMesh);
 
-function onReset() {
-  advectMat.uniforms.uReset.value = 1;
-  nucMesh.material.uniforms.uSeed.value = Math.random() * 50;
-  organN = 0;
-  for (let i = 3; i < nc && organN < 160; i += 3) {
-    if (Math.random() < 0.3) continue;
-    const r = Math.random(), k = organN++;
-    organIdx[k] = i;
-    organ.type[k] = r < 0.34 ? 0 : r < 0.5 ? 1 : r < 0.74 ? 2 : 3;
-    organ.size[k] = organ.type[k] === 0 ? 0.2 + Math.random() * 0.2 : organ.type[k] === 1 ? 0.14 + Math.random() * 0.14 : organ.type[k] === 2 ? 0.2 + Math.random() * 0.2 : 0.03 + Math.random() * 0.04;
-    organ.seed[k] = Math.random();
-  }
-  organ.geo.attributes.aSize.needsUpdate = organ.geo.attributes.aType.needsUpdate = organ.geo.attributes.aSeed.needsUpdate = true;
-  organ.geo.setDrawRange(0, organN);
-}
-
 // ── final pass: focus falloff, vignette, grain ──
 let sceneRT = new THREE.WebGLRenderTarget(4, 4, { samples: 4 });
 const postMat = new THREE.ShaderMaterial({
@@ -736,42 +874,103 @@ const postMat = new THREE.ShaderMaterial({
     }`,
   depthTest: false, depthWrite: false,
 });
+const quadScene = new THREE.Scene(); const quadMesh = new THREE.Mesh(quadGeo, postMat); quadMesh.frustumCulled = false; quadScene.add(quadMesh);
 
-// ───────────────────────── per-frame geometry ─────────────────────────
-function updateGeometry() {
-  // fluid splats
-  for (let i = 0; i < np; i++) { fPos[i * 3] = px[i]; fPos[i * 3 + 2] = pz[i]; fVel[i * 2] = px[i] - pfx[i]; fVel[i * 2 + 1] = pz[i] - pfz[i]; }
-  for (let q = 0; q < NSPLAT; q++) { const i = np + q; fPos[i * 3] = nuc.x + nucOff[q][0] * NR; fPos[i * 3 + 2] = nuc.z + nucOff[q][1] * NR; fVel[i * 2] = nuc.x - nuc.fx; fVel[i * 2 + 1] = nuc.z - nuc.fz; }
-  trailHead = (trailHead + 1) % TRAIL; trail[trailHead * 2] = nuc.x; trail[trailHead * 2 + 1] = nuc.z;
-  let fi = np + NSPLAT;
-  for (let a = 1; a < TRAIL; a++) {
-    const t = (trailHead - a + TRAIL) % TRAIL, w = (1 - a / TRAIL) * 0.9;
-    for (let q = 0; q < TSPL; q++, fi++) { fPos[fi * 3] = trail[t * 2] + nucOff[q][0] * NR * 1.25; fPos[fi * 3 + 2] = trail[t * 2 + 1] + nucOff[q][1] * NR * 1.25; fVel[fi * 2] = fVel[fi * 2 + 1] = 0; fW[fi] = w; }
-  }
-  fieldGeo.attributes.position.needsUpdate = fieldGeo.attributes.aVel.needsUpdate = fieldGeo.attributes.aW.needsUpdate = true; fieldGeo.setDrawRange(0, fi);
-  const hw = MW * 0.5, yb = hNow + 0.012, wp = wall.pos, bp = band.pos, RW = 0.3;
+// ───────────────────────── the cell on stage ─────────────────────────
+let S = null, seed = (Math.random() * 1e6) | 0, specimen = 0, death = 0, beatT = 0, hNow = H, time = 0, peelSet = false;
+// the skirt: the striped outer layer that carries the cilia. It rides on the blocks until the cell dies, then peels off in ribbons.
+const sx = new Float32Array(NM), sz = new Float32Array(NM), svx = new Float32Array(NM), svz = new Float32Array(NM);
+const snx = new Float32Array(NM), snz = new Float32Array(NM), sFlat = new Float32Array(NM), sPeelAt = new Float32Array(NM);
+const sAtt = new Uint8Array(NM), sBrk = new Uint8Array(NM), pnx = new Float32Array(NM), pnz = new Float32Array(NM), tgx = new Float32Array(NM), tgz = new Float32Array(NM);
+
+function newCell() {
+  seed = (seed * 31 + 7919) % 1000003; S = createSim(seed); specimen++;
+  const el = document.getElementById('specimen'); if (el) el.textContent = String(specimen).padStart(2, '0');
+  death = 0; hNow = H; peelSet = false;
+  for (let i = 0; i < NM; i++) { sAtt[i] = 1; sBrk[i] = 0; sFlat[i] = 0; svx[i] = svz[i] = 0; sPeelAt[i] = 1e9; tgx[i] = 1; tgz[i] = 0; }
+  nucMesh.material.uniforms.uSeed.value = Math.random() * 50;
+  let k = 0;
+  for (const b of S.bodies) if (!b.solid) { organ.type[k] = 0; organ.size[k] = b.r * 2; organ.seed[k] = b.seed; k++; }
+  for (const b of S.bits) { organ.type[k] = b.type; organ.seed[k] = b.seed; organ.size[k] = b.type === 1 ? 0.15 + b.seed * 0.15 : b.type === 2 ? 0.22 + b.seed * 0.2 : 0.035 + b.seed * 0.04; k++; }
+  organ.geo.attributes.aSize.needsUpdate = organ.geo.attributes.aType.needsUpdate = organ.geo.attributes.aSeed.needsUpdate = true;
+  organ.geo.setDrawRange(0, k);
+}
+
+function skirtLink(i) { const k = (i + 1) % NM; return !sBrk[i] && !(sAtt[i] && sAtt[k] && !S.linkOn[i]); }
+function stepSkirt(dt) {
+  const { mx, my, linkOn, linkRest, nuc, fluid } = S;
+  // each block's own direction: along its intact links; a loose block keeps the one it had
   for (let i = 0; i < NM; i++) {
-    const k = (i + 1) % NM, o = i * 12;
-    if (broken[i]) for (let q = 0; q < 12; q++) bp[o + q] = 0;
-    else {
-      const ax = mx[i], az = mz[i], bx = mx[k], bz = mz[k];
-      bp[o] = ax - pnx[i] * hw; bp[o + 1] = yb; bp[o + 2] = az - pnz[i] * hw;
-      bp[o + 3] = ax + pnx[i] * hw; bp[o + 4] = yb; bp[o + 5] = az + pnz[i] * hw;
-      bp[o + 6] = bx - pnx[k] * hw; bp[o + 7] = yb; bp[o + 8] = bz - pnz[k] * hw;
-      bp[o + 9] = bx + pnx[k] * hw; bp[o + 10] = yb; bp[o + 11] = bz + pnz[k] * hw;
+    const p = (i + NM - 1) % NM, k = (i + 1) % NM; let tx = 0, tz = 0;
+    if (linkOn[i]) { tx += mx[k] - mx[i]; tz += my[k] - my[i]; } if (linkOn[p]) { tx += mx[i] - mx[p]; tz += my[i] - my[p]; }
+    const l = Math.hypot(tx, tz); if (l > 1e-5) { tgx[i] = tx / l; tgz[i] = tz / l; }
+    pnx[i] = tgz[i]; pnz[i] = -tgx[i];
+  }
+  if (S.dying >= 0 && !peelSet) {
+    // the skirt will peel away from the tear in both directions, splitting into long ribbons as it goes
+    peelSet = true; let run = 0, len = 9 + Math.random() * 12;
+    for (let a = 0; a < NM; a++) {
+      const k = (S.tearAt + 1 + a) % NM, d = Math.min(a, NM - 1 - a);
+      sPeelAt[k] = 4 + d * 0.24 + Math.random() * 0.7;
+      if (++run > len) { sBrk[k] = 1; run = 0; len = 9 + Math.random() * 14; }
     }
+  }
+  const ww = MW * 0.45;
+  for (let i = 0; i < NM; i++) {
+    if (sAtt[i] && S.dying > sPeelAt[i]) { sAtt[i] = 0; const kick = 0.004 + Math.random() * 0.005; svx[i] = pnx[i] * kick; svz[i] = pnz[i] * kick; }
+    if (sAtt[i]) { sx[i] = mx[i] + pnx[i] * ww; sz[i] = my[i] + pnz[i] * ww; snx[i] = pnx[i]; snz[i] = pnz[i]; continue; }
+    sFlat[i] = Math.min(1, sFlat[i] + 1 / 90);
+    svx[i] *= 0.985; svz[i] *= 0.985;
+    sx[i] += svx[i] + fluid.velU(sx[i], sz[i]) * dt * 0.8; sz[i] += svz[i] + fluid.velV(sx[i], sz[i]) * dt * 0.8;
+    const dx = sx[i] - nuc.x, dz = sz[i] - nuc.y, d = Math.hypot(dx, dz), md = nuc.r + 0.12;     // the nucleus still shoves loose ribbon about
+    if (d < md && d > 1e-6) { sx[i] += dx / d * (md - d); sz[i] += dz / d * (md - d); }
+  }
+  for (let it = 0; it < 3; it++) for (let i = 0; i < NM; i++) {
+    const k = (i + 1) % NM; if (!skirtLink(i) || (sAtt[i] && sAtt[k])) continue;
+    const dx = sx[k] - sx[i], dz = sz[k] - sz[i], d = Math.hypot(dx, dz) || 1e-6, c = (d - linkRest[i] * 1.02) / d;
+    const wi = sAtt[i] ? 0 : sAtt[k] ? 1 : 0.5, wk = sAtt[k] ? 0 : sAtt[i] ? 1 : 0.5;
+    sx[i] += dx * c * wi; sz[i] += dz * c * wi; sx[k] -= dx * c * wk; sz[k] -= dz * c * wk;
+  }
+  // a loose ribbon lies flat; its width runs across its own length
+  for (let i = 0; i < NM; i++) {
+    if (sAtt[i]) continue;
+    const p = (i + NM - 1) % NM, k = (i + 1) % NM, a = skirtLink(p) ? p : i, b = skirtLink(i) ? k : i; if (a === b) continue;
+    const tx = sx[b] - sx[a], tz = sz[b] - sz[a], l = Math.hypot(tx, tz) || 1e-6;
+    snx[i] += (tz / l - snx[i]) * 0.3; snz[i] += (-tx / l - snz[i]) * 0.3;
+  }
+}
+
+function updateGeometry() {
+  const { mx, my, linkOn, linkRest, nuc, fluid } = S;
+  // the fluid, as two textures: how much cytoplasm, and where each bit of it came from
+  const { c, ax, ay, bx, by } = fluid;
+  for (let k = 0, o = 0; k < GN; k++, o += 4) { dataA[o] = c[k]; dataA[o + 1] = ax[k]; dataA[o + 2] = ay[k]; dataB[o] = bx[k]; dataB[o + 1] = by[k]; }
+  texA.needsUpdate = texB.needsUpdate = true; uWA.value = fluid.weightA(S.time);
+  // one bead per block, from the middle of one link to the middle of the next
+  const hw = MW * 0.5, yb = hNow + 0.012, wp = wall.pos, bp = band.pos, RWD = 0.3, half = S.L * 0.5;
+  for (let i = 0; i < NM; i++) {
+    const p = (i + NM - 1) % NM, k = (i + 1) % NM, o = i * 12;
+    let ax_, az_, bx_, bz_, anx, anz, bnx, bnz;
+    if (linkOn[p]) { ax_ = (mx[p] + mx[i]) / 2; az_ = (my[p] + my[i]) / 2; const tx = mx[i] - mx[p], tz = my[i] - my[p], l = Math.hypot(tx, tz) || 1; anx = tz / l; anz = -tx / l; }
+    else { ax_ = mx[i] - tgx[i] * half; az_ = my[i] - tgz[i] * half; anx = pnx[i]; anz = pnz[i]; }
+    if (linkOn[i]) { bx_ = (mx[k] + mx[i]) / 2; bz_ = (my[k] + my[i]) / 2; const tx = mx[k] - mx[i], tz = my[k] - my[i], l = Math.hypot(tx, tz) || 1; bnx = tz / l; bnz = -tx / l; }
+    else { bx_ = mx[i] + tgx[i] * half; bz_ = my[i] + tgz[i] * half; bnx = pnx[i]; bnz = pnz[i]; }
+    bp[o] = ax_ - anx * hw; bp[o + 1] = yb; bp[o + 2] = az_ - anz * hw; bp[o + 3] = ax_ + anx * hw; bp[o + 4] = yb; bp[o + 5] = az_ + anz * hw;
+    bp[o + 6] = bx_ - bnx * hw; bp[o + 7] = yb; bp[o + 8] = bz_ - bnz * hw; bp[o + 9] = bx_ + bnx * hw; bp[o + 10] = yb; bp[o + 11] = bz_ + bnz * hw;
+    // a link about to give flushes pink
+    let st = 0; if (linkOn[i]) st = Math.hypot(mx[k] - mx[i], my[k] - my[i]) / linkRest[i]; if (linkOn[p]) st = Math.max(st, Math.hypot(mx[i] - mx[p], my[i] - my[p]) / linkRest[p]);
+    band.dmg.fill(Math.max(0, (st - 1.05) / (TEAR - 1.05)), i * 4, i * 4 + 4);
     if (!skirtLink(i)) { for (let q = 0; q < 12; q++) wp[o + q] = 0; continue; }
-    // standing up it is a wall from the beads down to the slide; peeled off, the same strip lies flat
+    // standing up the skirt is a wall from the blocks down to the slide; peeled off, the same strip lies flat
     for (let e = 0; e < 2; e++) {
-      const j = e ? k : i, fl = sFlat[j], off = RW * 0.5 * fl, oo = o + e * 6;
+      const j = e ? k : i, fl = sFlat[j], off = RWD * 0.5 * fl, oo = o + e * 6;
       wp[oo] = sx[j] - snx[j] * off; wp[oo + 1] = yb * (1 - fl) + 0.02; wp[oo + 2] = sz[j] - snz[j] * off;
       wp[oo + 3] = sx[j] + snx[j] * off; wp[oo + 4] = 0.012; wp[oo + 5] = sz[j] + snz[j] * off;
     }
   }
-  for (let i = 0; i < NM; i++) band.dmg.fill(damage[i], i * 4, i * 4 + 4);
   wall.geo.attributes.position.needsUpdate = band.geo.attributes.position.needsUpdate = band.geo.attributes.aDmg.needsUpdate = true;
-  // cilia
-  const cp = cilia.pos; let c = 0;
+  // cilia, rooted in the skirt
+  const cp = cilia.pos; let cc = 0;
   for (let h = 0; h < hair.length; h++) {
     const i = (h / HAIRS) | 0, k = (i + 1) % NM, hh = hair[h], s = skirtLink(i) ? hh.s : 0;
     let x = sx[i] + (sx[k] - sx[i]) * s, z = sz[i] + (sz[k] - sz[i]) * s;
@@ -781,36 +980,37 @@ function updateGeometry() {
     for (let q = 0; q < HSEG; q++) {
       const t = (q + 0.5) / HSEG, ang = base + hh.curl * t + 0.35 * Math.sin(beatT * hh.sp + hh.ph - t * 2.5) * (0.3 + t) + hh.curl * 0.5 * death * t;
       const x2 = x + Math.cos(ang) * st, z2 = z + Math.sin(ang) * st, y2 = hNow * 0.7 * (1 - fl) * (1 - (q + 1) / HSEG) ** 2 + 0.01;
-      cp[c++] = x; cp[c++] = y; cp[c++] = z; cp[c++] = x2; cp[c++] = y2; cp[c++] = z2; x = x2; z = z2; y = y2;
+      cp[cc++] = x; cp[cc++] = y; cp[cc++] = z; cp[cc++] = x2; cp[cc++] = y2; cp[cc++] = z2; x = x2; z = z2; y = y2;
     }
   }
   cilia.geo.attributes.position.needsUpdate = true;
-  // organelles ride on the cytoplasm
-  for (let k = 0; k < organN; k++) { const i = organIdx[k]; organ.pos[k * 3] = px[i]; organ.pos[k * 3 + 1] = hNow + 0.015; organ.pos[k * 3 + 2] = pz[i]; }
+  // vesicles and inclusions ride in the cytoplasm
+  let k = 0;
+  for (const b of S.bodies) if (!b.solid) { organ.pos[k * 3] = b.x; organ.pos[k * 3 + 1] = hNow + 0.015; organ.pos[k * 3 + 2] = b.y; k++; }
+  for (const b of S.bits) { organ.pos[k * 3] = b.x; organ.pos[k * 3 + 1] = hNow + 0.015; organ.pos[k * 3 + 2] = b.y; k++; }
   organ.geo.attributes.position.needsUpdate = true;
-  // filaments
   for (let r = 0; r < ROPES; r++) {
-    const rp = ropeLines[r].pos, b = nc + r * RLEN;
-    for (let i = 0; i < RLEN; i++) { rp[i * 3] = px[b + i]; rp[i * 3 + 1] = hNow + 0.02; rp[i * 3 + 2] = pz[b + i]; }
+    const rp = ropeLines[r].pos;
+    for (let i = 0; i < RLEN; i++) { rp[i * 3] = S.rx[r * RLEN + i]; rp[i * 3 + 1] = hNow + 0.02; rp[i * 3 + 2] = S.ry[r * RLEN + i]; }
     ropeLines[r].geo.attributes.position.needsUpdate = true;
   }
-  // nucleus
-  nucMesh.position.set(nuc.x, hNow + 0.03, nuc.z); nucMesh.material.uniforms.uRoll.value = nuc.roll;
-  // slide litter drifts; anything the cell runs over gets nudged aside
+  nucMesh.position.set(nuc.x, hNow + 0.03, nuc.y); nucMesh.scale.setScalar(nuc.r / NR); nucMesh.material.uniforms.uRoll.value = nuc.angle;
+  // litter on the slide drifts with the medium
+  const fl2 = [0, 0];
   for (let i = 0; i < LIT; i++) {
-    litV[i * 2] = (litV[i * 2] + (Math.random() - 0.5) * 0.0006) * 0.97; litV[i * 2 + 1] = (litV[i * 2 + 1] + (Math.random() - 0.5) * 0.0006) * 0.97;
-    litter.pos[i * 3] += litV[i * 2]; litter.pos[i * 3 + 2] += litV[i * 2 + 1];
+    mediumFlow(litter.pos[i * 3], litter.pos[i * 3 + 2], S.time, fl2);
+    litV[i * 2] = (litV[i * 2] + (Math.random() - 0.5) * 0.0005) * 0.97; litV[i * 2 + 1] = (litV[i * 2 + 1] + (Math.random() - 0.5) * 0.0005) * 0.97;
+    litter.pos[i * 3] += litV[i * 2] + fl2[0] / 60; litter.pos[i * 3 + 2] += litV[i * 2 + 1] + fl2[1] / 60;
   }
   litter.geo.attributes.position.needsUpdate = true;
-  const wpz = worms.pos; c = 0;
+  const wpz = worms.pos; cc = 0;
   for (const w of wormS) {
     w.a += (Math.random() - 0.5) * 0.08; w.x += Math.cos(w.a) * w.sp * 0.004; w.z += Math.sin(w.a) * w.sp * 0.004;
     if (Math.abs(w.x) > 9) w.a = Math.PI - w.a; if (Math.abs(w.z) > 6) w.a = -w.a;
     const st = w.len / WSEG; let x = w.x, z = w.z;
     for (let q = 0; q < WSEG; q++) {
-      const ang = w.a + Math.PI + 0.9 * Math.sin(time * 4 * w.sp + w.ph + q * 0.9);
-      const x2 = x + Math.cos(ang) * st, z2 = z + Math.sin(ang) * st;
-      wpz[c++] = x; wpz[c++] = 0.012; wpz[c++] = z; wpz[c++] = x2; wpz[c++] = 0.012; wpz[c++] = z2; x = x2; z = z2;
+      const ang = w.a + Math.PI + 0.9 * Math.sin(time * 4 * w.sp + w.ph + q * 0.9), x2 = x + Math.cos(ang) * st, z2 = z + Math.sin(ang) * st;
+      wpz[cc++] = x; wpz[cc++] = 0.012; wpz[cc++] = z; wpz[cc++] = x2; wpz[cc++] = 0.012; wpz[cc++] = z2; x = x2; z = z2;
     }
   }
   worms.geo.attributes.position.needsUpdate = true;
@@ -823,8 +1023,8 @@ function resize() {
   const bw = Math.floor(w * dpr), bh = Math.floor(h * dpr);
   sceneRT.setSize(bw, bh); postMat.uniforms.uRes.value.set(bw, bh);
   camera.aspect = w / h;
-  const k = Math.max(1, 4.3 / (14.6 * Math.tan(15 * Math.PI / 180) * camera.aspect));   // pull back on narrow screens
-  camera.position.set(0, 12.2 * k, 8.0 * k); camera.lookAt(0, 0, 0.25); camera.updateProjectionMatrix();
+  const k = Math.max(1, 5.4 / (19.6 * Math.tan(15 * Math.PI / 180) * camera.aspect));   // pull back on narrow screens
+  camera.position.set(0, 16.2 * k, 11.0 * k); camera.lookAt(0, 0, 0.3); camera.updateProjectionMatrix();
   uPx.value = bh / (2 * Math.tan(15 * Math.PI / 180));
 }
 new ResizeObserver(resize).observe(stage); resize();
@@ -835,44 +1035,42 @@ function toWorld(e) {
   ndc.set((e.clientX - r.left) / r.width * 2 - 1, -((e.clientY - r.top) / r.height) * 2 + 1);
   ray.setFromCamera(ndc, camera); return ray.ray.intersectPlane(plane, hit);
 }
-const cv = renderer.domElement;
+const cv = renderer.domElement; let lastTap = 0, lastTapX = 0, lastTapY = 0;
 cv.addEventListener('pointerdown', (e) => {
   const p = toWorld(e); if (!p) return;
-  if (Math.hypot(p.x - nuc.x, p.z - nuc.z) < NR * (e.pointerType === 'touch' ? 2.4 : 1.5)) {
-    nuc.drag = true; nuc.tx = p.x; nuc.tz = p.z; cv.setPointerCapture(e.pointerId); stage.classList.add('grabbing'); e.preventDefault();
-  }
+  // a second press in the same place, straight after the first, tears the wall there
+  const now = performance.now(), dbl = now - lastTap < 350 && Math.hypot(e.clientX - lastTapX, e.clientY - lastTapY) < 24;
+  lastTap = now; lastTapX = e.clientX; lastTapY = e.clientY;
+  if (dbl && S.tear(p.x, p.z)) return;
+  if (S.grabAt(p.x, p.z)) { cv.setPointerCapture(e.pointerId); stage.classList.add('grabbing'); e.preventDefault(); }
 });
 cv.addEventListener('pointermove', (e) => {
   const p = toWorld(e); if (!p) return;
-  if (nuc.drag) { nuc.tx = p.x; nuc.tz = p.z; }
-  stage.classList.toggle('can-grab', Math.hypot(p.x - nuc.x, p.z - nuc.z) < NR * 1.5);
+  if (S.grabbed) S.moveGrab(p.x, p.z); else stage.classList.toggle('can-grab', S.near(p.x, p.z));
 });
-const drop = () => { nuc.drag = false; stage.classList.remove('grabbing'); };
+const drop = () => { S.release(); stage.classList.remove('grabbing'); };
 cv.addEventListener('pointerup', drop); cv.addEventListener('pointercancel', drop);
-document.getElementById('again').addEventListener('click', resetSim);
-window.addEventListener('keydown', (e) => { if (e.key === 'r' || e.key === 'R') resetSim(); });
+document.getElementById('again').addEventListener('click', newCell);
+document.getElementById('kill').addEventListener('click', () => S.kill());
+window.addEventListener('keydown', (e) => { if (e.key === 'r' || e.key === 'R') newCell(); else if (e.key === 'k' || e.key === 'K') S.kill(); });
 
 // ───────────────────────── loop ─────────────────────────
-function frame() {
-  time += 1 / 60; uTime.value = time;
-  stepFrame();
-  uFade.value = death; hNow = H * (1 - 0.62 * death); beatT += (1 - death) / 60;
+function simStep() {
+  const dt = 1 / 60; time += dt; uTime.value = time;
+  S.step(dt); stepSkirt(dt);
+  death = S.dying < 0 ? 0 : smooth((S.dying - 1) / 9);
+  uFade.value = death; hNow = H * (1 - 0.62 * death); beatT += (1 - death) * dt;
+}
+function draw() {
   wallMesh.renderOrder = death > 0.35 ? 7.5 : 3; cilia.obj.renderOrder = death > 0.35 ? 7.6 : 4;
   cyto.position.y = hNow; cilia.obj.material.uniforms.uOpacity.value = 0.5 * (1 - 0.25 * death);
   updateGeometry();
-  // density + velocity
-  renderer.setRenderTarget(fieldRT); renderer.setClearColor(0x000000, 0); renderer.clear(); renderer.render(fieldScene, quadCam);
-  // carry the stain coordinates along
-  quadMesh.material = advectMat; advectMat.uniforms.tPrev.value = dispA.texture;
-  renderer.setRenderTarget(dispB); renderer.render(quadScene, quadCam);
-  [dispA, dispB] = [dispB, dispA]; advectMat.uniforms.uReset.value = 0;
-  fieldUniforms.tField.value = fieldRT.texture; fieldUniforms.tDisp.value = dispA.texture;
-  // the specimen
   renderer.setRenderTarget(sceneRT); renderer.setClearColor(0xe6e5ea, 1); renderer.clear(); renderer.render(scene, camera);
-  quadMesh.material = postMat; postMat.uniforms.tScene.value = sceneRT.texture;
+  postMat.uniforms.tScene.value = sceneRT.texture;
   renderer.setRenderTarget(null); renderer.render(quadScene, quadCam);
 }
-resetSim();
+function frame() { simStep(); draw(); }
+newCell();
 renderer.setAnimationLoop(frame);
-window.__lab = { step: () => { time += 1 / 60; stepFrame(); }, P, nuc, state: () => ({ maxElong: Math.max(...elong).toFixed(2), death: death.toFixed(2), ruptured, np, nc, intact: NM - broken.reduce((a, b) => a + b, 0), time }), mx, mz, rest: rest0, frame, reset: resetSim };
+window.__lab = { get S() { return S; }, simStep, draw, newCell, state: () => ({ t: S.time.toFixed(1), dying: S.dying.toFixed(1), links: S.linkOn.reduce((a, b) => a + b, 0), leaked: S.leaked().toFixed(2), centre: [S.frame.x.toFixed(2), S.frame.y.toFixed(2)] }) };
 </script>
