@@ -456,8 +456,8 @@ const LIT = 70, litV = new Float32Array(LIT * 2);
 for (let i = 0; i < LIT; i++) {
   const r = Math.random();
   litter.pos[i * 3] = (Math.random() - 0.5) * 17; litter.pos[i * 3 + 1] = 0.01; litter.pos[i * 3 + 2] = (Math.random() - 0.5) * 11;
-  litter.type[i] = r < 0.34 ? 2 : r < 0.42 ? 4 : r < 0.7 ? 5 : 3;
-  litter.size[i] = litter.type[i] === 2 ? 0.3 + Math.random() * 0.3 : litter.type[i] === 4 ? 0.3 + Math.random() * 0.12 : litter.type[i] === 5 ? 0.12 + Math.random() * 0.14 : 0.04 + Math.random() * 0.06;
+  litter.type[i] = r < 0.14 ? 2 : r < 0.2 ? 4 : r < 0.5 ? 5 : 3;
+  litter.size[i] = litter.type[i] === 2 ? 0.22 + Math.random() * 0.2 : litter.type[i] === 4 ? 0.3 + Math.random() * 0.12 : litter.type[i] === 5 ? 0.12 + Math.random() * 0.14 : 0.04 + Math.random() * 0.06;
   litter.seed[i] = Math.random();
 }
 const organ = spriteCloud(160, 6);
